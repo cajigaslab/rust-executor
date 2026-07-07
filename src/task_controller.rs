@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use crate::behavior_task::{self, SharedTask};
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::pb::task_controller_grpc::{TaskConfig, TaskResult};
@@ -5,12 +8,24 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Incremented every time a trial (task run) finishes, so other subsystems —
+/// e.g. `gfx`, which auto-clears the operator view's touch/gaze traces when
+/// this changes — can detect that a trial ended without polling
+/// `current_task` for a `Some -> None` transition, which can be missed if a
+/// new task starts before the next poll.
+pub type SharedTrialCounter = Arc<AtomicU64>;
+
+pub fn shared_trial_counter() -> SharedTrialCounter {
+    Arc::new(AtomicU64::new(0))
+}
+
 /// Drives the `execution` stream: for every `TaskConfig` the server sends,
 /// look up its `task_type` in the `BehaviorTask` registry, run that task
 /// (installing it as the current task so the render thread can draw its
-/// progress for as long as it runs, then dropping it once done), and report a
-/// successful `TaskResult` back on the same stream.
-pub async fn run(addr: String, current_task: SharedTask) -> anyhow::Result<()> {
+/// progress for as long as it runs, then dropping it once done), bump
+/// `trial_counter`, and report a successful `TaskResult` back on the same
+/// stream.
+pub async fn run(addr: String, current_task: SharedTask, trial_counter: SharedTrialCounter) -> anyhow::Result<()> {
     let registry = behavior_task::registry();
 
     let mut client = TaskControllerClient::connect(addr.clone()).await?;
@@ -32,6 +47,7 @@ pub async fn run(addr: String, current_task: SharedTask) -> anyhow::Result<()> {
                 *current_task.lock().unwrap() = Some(task.clone());
                 task.run().await;
                 *current_task.lock().unwrap() = None;
+                trial_counter.fetch_add(1, Ordering::Relaxed);
             }
             None => {
                 tracing::warn!("no BehaviorTask registered for task_type {task_type:?}");

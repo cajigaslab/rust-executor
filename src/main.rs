@@ -1,4 +1,7 @@
+mod analog;
 mod behavior_task;
+mod canvas;
+mod eye_tracking;
 mod gfx;
 mod pb;
 mod state;
@@ -25,6 +28,11 @@ fn main() -> anyhow::Result<()> {
 
     let current_task = behavior_task::shared_task();
     let window_position = touch_screen::shared_window_position();
+    let window_size = touch_screen::shared_window_size();
+    let touch_path = touch_screen::shared_touch_path();
+    let gaze_path = eye_tracking::shared_gaze_path();
+    let angular_scaling = eye_tracking::shared_angular_scaling();
+    let trial_counter = task_controller::shared_trial_counter();
 
     // The Thalamus/TaskController gRPC clients run on a background thread with
     // their own Tokio runtime; the windowing/Vulkan render loop below needs the
@@ -34,6 +42,11 @@ fn main() -> anyhow::Result<()> {
     // it back once it's built.
     let grpc_current_task = current_task.clone();
     let grpc_window_position = window_position.clone();
+    let grpc_window_size = window_size.clone();
+    let grpc_touch_path = touch_path.clone();
+    let grpc_gaze_path = gaze_path.clone();
+    let grpc_angular_scaling = angular_scaling.clone();
+    let grpc_trial_counter = trial_counter.clone();
     let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("grpc".to_string())
@@ -46,7 +59,16 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let _ = handle_tx.send(runtime.handle().clone());
-            if let Err(e) = runtime.block_on(run_grpc(addr, grpc_current_task, grpc_window_position)) {
+            if let Err(e) = runtime.block_on(run_grpc(
+                addr,
+                grpc_current_task,
+                grpc_window_position,
+                grpc_window_size,
+                grpc_touch_path,
+                grpc_gaze_path,
+                grpc_angular_scaling,
+                grpc_trial_counter,
+            )) {
                 tracing::error!("gRPC client task ended: {e}");
             }
         })?;
@@ -55,12 +77,29 @@ fn main() -> anyhow::Result<()> {
         .recv()
         .map_err(|_| anyhow::anyhow!("grpc thread exited before it started its Tokio runtime"))?;
 
-    gfx::run(current_task, tokio_handle, window_position)
+    gfx::run(
+        current_task,
+        tokio_handle,
+        window_position,
+        window_size,
+        touch_path,
+        gaze_path,
+        trial_counter,
+    )
 }
 
-async fn run_grpc(mut addr: String, current_task: SharedTask, window_position: touch_screen::SharedWindowPosition) -> anyhow::Result<()> {
-    // The TOUCH_SCREEN analog stream connects to this original address, not
-    // wherever observable_bridge_v2 ends up redirecting to below.
+async fn run_grpc(
+    mut addr: String,
+    current_task: SharedTask,
+    window_position: touch_screen::SharedWindowPosition,
+    window_size: touch_screen::SharedWindowSize,
+    touch_path: touch_screen::SharedTouchPath,
+    gaze_path: eye_tracking::SharedGazePath,
+    angular_scaling: eye_tracking::SharedAngularScaling,
+    trial_counter: task_controller::SharedTrialCounter,
+) -> anyhow::Result<()> {
+    // The TOUCH_SCREEN/OCULOMATIC analog streams connect to this original
+    // address, not wherever observable_bridge_v2 ends up redirecting to below.
     let unredirected_addr = addr.clone();
 
     let mut app_state = Value::Object(Default::default());
@@ -98,7 +137,7 @@ async fn run_grpc(mut addr: String, current_task: SharedTask, window_position: t
             continue;
         }
 
-        apply_transaction(&mut app_state, &first.changes)?;
+        apply_transaction(&mut app_state, &first.changes, &angular_scaling)?;
         inbound = Some(stream);
         outbound_keepalive = Some(tx);
         break;
@@ -115,32 +154,64 @@ async fn run_grpc(mut addr: String, current_task: SharedTask, window_position: t
     let task_controller_addr = addr.clone();
     let touch_current_task = current_task.clone();
     tokio::spawn(async move {
-        if let Err(e) = task_controller::run(task_controller_addr, current_task).await {
+        if let Err(e) = task_controller::run(task_controller_addr, current_task, trial_counter).await {
             tracing::error!("task controller execution stream failed: {e}");
         }
     });
+
+    // TOUCH_SCREEN and OCULOMATIC both just hit this same service's `analog`
+    // RPC for different node types, so they share one connection rather than
+    // each dialing their own.
+    let analog_client = ThalamusClient::connect(unredirected_addr.clone()).await?;
+    let touch_client = analog_client.clone();
     tokio::spawn(async move {
-        if let Err(e) = touch_screen::run(unredirected_addr, touch_current_task, window_position).await {
+        if let Err(e) =
+            touch_screen::run(touch_client, touch_current_task, window_position, window_size, touch_path).await
+        {
             tracing::error!("touch screen analog stream failed: {e}");
+        }
+    });
+    let gaze_angular_scaling = angular_scaling.clone();
+    tokio::spawn(async move {
+        if let Err(e) = eye_tracking::run(analog_client, gaze_angular_scaling, gaze_path).await {
+            tracing::error!("eye tracking analog stream failed: {e}");
         }
     });
 
     while let Some(transaction) = inbound.message().await? {
-        apply_transaction(&mut app_state, &transaction.changes)?;
+        apply_transaction(&mut app_state, &transaction.changes, &angular_scaling)?;
     }
 
     Ok(())
 }
 
-fn apply_transaction(app_state: &mut Value, changes: &[ObservableChange]) -> anyhow::Result<()> {
+fn apply_transaction(
+    app_state: &mut Value,
+    changes: &[ObservableChange],
+    angular_scaling: &eye_tracking::SharedAngularScaling,
+) -> anyhow::Result<()> {
+    let mut eye_scaling_changed = false;
     for change in changes {
+        if touches_eye_scaling(&change.address) {
+            eye_scaling_changed = true;
+        }
         let action = change.action();
         if let Err(e) = state::apply_change(app_state, &change.address, &change.value, action) {
             tracing::warn!("failed to apply change {change:?}: {e}");
         }
     }
+    if eye_scaling_changed {
+        eye_tracking::refresh_angular_scaling(app_state, angular_scaling);
+    }
     println!("{}", serde_json::to_string_pretty(app_state)?);
     Ok(())
+}
+
+/// Whether an `observable_bridge_v2` change address falls under
+/// `['eye_scaling']` (or replaces the whole tree, address `""`), meaning the
+/// cached `AngularScaling` config may be stale and needs refreshing.
+fn touches_eye_scaling(address: &str) -> bool {
+    address.is_empty() || address.starts_with("['eye_scaling']")
 }
 
 /// Thalamus redirects use the bare `grpc::CreateChannel` target format

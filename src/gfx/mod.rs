@@ -11,17 +11,20 @@ use imgui_rs_vulkan_renderer::vulkan::{
 };
 use imgui_rs_vulkan_renderer::{Options, Renderer};
 use imgui_winit_support::WinitPlatform;
-use skia_safe::{Color4f, Picture, PictureRecorder, Rect};
+use skia_safe::{Color4f, Paint, PaintStyle, PathBuilder, Picture, PictureRecorder, Rect};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{WindowAttributes, WindowId};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::behavior_task::{SharedTask, Window};
-use crate::touch_screen::SharedWindowPosition;
+use crate::eye_tracking::SharedGazePath;
+use crate::task_controller::SharedTrialCounter;
+use crate::touch_screen::{SharedTouchPath, SharedWindowPosition, SharedWindowSize};
 use base::VulkanBase;
 use offscreen::OffscreenTarget;
 use skia_offscreen::SkiaOffscreen;
@@ -32,9 +35,11 @@ use window_target::{SwapchainWindow, MAX_FRAMES_IN_FLIGHT};
 const BLANK_CLEAR_COLOR: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 
 /// Resolution of both offscreen render targets (subject and operator).
+/// Backed by `crate::canvas`, the fixed canvas space touch/gaze input is
+/// also rescaled into.
 const OFFSCREEN_EXTENT: vk::Extent2D = vk::Extent2D {
-    width: 1280,
-    height: 720,
+    width: crate::canvas::WIDTH,
+    height: crate::canvas::HEIGHT,
 };
 
 /// Upper bound on the render loop's throughput. Without this, `ControlFlow::Poll`
@@ -42,6 +47,16 @@ const OFFSCREEN_EXTENT: vk::Extent2D = vk::Extent2D {
 /// visible benefit past what either window can present.
 const MAX_FPS: u32 = 1000;
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / MAX_FPS as u64);
+
+/// How often the operator view's touch and gaze paths are wiped (matches
+/// Thalamus's own `Canvas.__clear_periodically`).
+const TOUCH_PATH_CLEAR_INTERVAL: Duration = Duration::from_secs(60);
+/// Color and radius of each dot in the operator view's touch path.
+const TOUCH_DOT_COLOR: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+/// Color of each dot in the operator view's gaze path (matches Thalamus's own
+/// `AngularScalingConfig.paint`, which fills its gaze path with blue).
+const GAZE_DOT_COLOR: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+const DOT_RADIUS: f32 = 6.0;
 
 /// Tracks the render loop's throughput, updating an averaged reading twice a
 /// second rather than every frame (which at an uncapped framerate would just
@@ -81,6 +96,10 @@ pub fn run(
     current_task: SharedTask,
     tokio_handle: tokio::runtime::Handle,
     window_position: SharedWindowPosition,
+    window_size: SharedWindowSize,
+    touch_path: SharedTouchPath,
+    gaze_path: SharedGazePath,
+    trial_counter: SharedTrialCounter,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -90,7 +109,12 @@ pub fn run(
         current_task,
         tokio_handle,
         window_position,
+        window_size,
+        touch_path,
+        gaze_path,
+        trial_counter,
         result: Ok(()),
+        modifiers: ModifiersState::empty(),
     };
     event_loop.run_app(&mut app)?;
     app.result
@@ -117,6 +141,25 @@ struct Graphics {
     /// When the last frame was rendered, so `App::about_to_wait` can pace the
     /// loop to [`MAX_FPS`].
     last_frame_at: Instant,
+    /// When the operator view's touch and gaze paths were last wiped, so
+    /// `render_frame` can clear them every [`TOUCH_PATH_CLEAR_INTERVAL`].
+    touch_path_cleared_at: Instant,
+    /// The last `SharedTrialCounter` value observed, so `render_frame` can
+    /// detect a trial ending (the counter changing) and auto-clear the
+    /// touch/gaze traces if `auto_clear` is enabled. A counter (rather than
+    /// polling `current_task` for a `Some -> None` transition) so a trial
+    /// ending is never missed even if a new one starts before the next frame.
+    last_trial_count: u64,
+    /// Opacity (0-100) applied to touch/gaze trace dots in both views, set
+    /// via the operator UI's "Opacity" slider.
+    trace_opacity_percent: f32,
+    /// Whether the touch/gaze traces auto-clear when a trial ends, set via
+    /// the operator UI's "Auto Clear" checkbox.
+    auto_clear: bool,
+    /// Whether the touch/gaze traces are drawn at all, set via the operator
+    /// UI's "Show Touch"/"Show Gaze" checkboxes.
+    show_touch: bool,
+    show_gaze: bool,
 }
 
 struct App {
@@ -124,7 +167,15 @@ struct App {
     current_task: SharedTask,
     tokio_handle: tokio::runtime::Handle,
     window_position: SharedWindowPosition,
+    window_size: SharedWindowSize,
+    touch_path: SharedTouchPath,
+    gaze_path: SharedGazePath,
+    trial_counter: SharedTrialCounter,
     result: Result<()>,
+    /// Updated from `WindowEvent::ModifiersChanged` so `Ctrl+F` can be
+    /// recognized in `KeyboardInput`, which doesn't carry modifier state
+    /// itself.
+    modifiers: ModifiersState,
 }
 
 impl App {
@@ -141,11 +192,14 @@ impl ApplicationHandler for App {
         }
         match Graphics::new(event_loop) {
             Ok(graphics) => {
-                // Seed the initial position: `Moved`/`Resized` only fire on
-                // subsequent changes, not for the window's starting placement.
+                // Seed the initial position/size so they're not left at their
+                // defaults for the first frame or two before
+                // `about_to_wait`'s per-frame poll catches up.
                 if let Ok(position) = graphics.subject.window.inner_position() {
                     *self.window_position.lock().unwrap() = (position.x, position.y);
                 }
+                let size = graphics.subject.window.inner_size();
+                *self.window_size.lock().unwrap() = (size.width, size.height);
                 self.graphics = Some(graphics);
             }
             Err(e) => self.fail(event_loop, e),
@@ -174,18 +228,26 @@ impl ApplicationHandler for App {
                 .handle_event(graphics.imgui.io_mut(), &graphics.operator.window, &full_event);
         }
 
-        // Kept up to date here (rather than polled every frame) so
-        // `touch_screen::run` can translate touch points from screen
-        // coordinates to subject-window-local ones. `Moved`'s own payload is
-        // the outer position, so re-query `inner_position` for the content
-        // area's actual top-left instead of using it directly; `Resized` is
-        // also handled since resizing can shift it too (e.g. from a top/left
-        // edge or drag).
-        if window_id == graphics.subject.window.id()
-            && matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_))
-        {
-            if let Ok(position) = graphics.subject.window.inner_position() {
-                *self.window_position.lock().unwrap() = (position.x, position.y);
+        if let WindowEvent::ModifiersChanged(modifiers) = &event {
+            self.modifiers = modifiers.state();
+        }
+
+        if window_id == graphics.subject.window.id() {
+            if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+                if key_event.state == ElementState::Pressed && !key_event.repeat {
+                    match key_event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyF) if self.modifiers.control_key() => {
+                            graphics
+                                .subject
+                                .window
+                                .set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            graphics.subject.window.set_fullscreen(None);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -194,7 +256,37 @@ impl ApplicationHandler for App {
         let Some(graphics) = &mut self.graphics else {
             return;
         };
-        if let Err(e) = graphics.render_frame(&self.current_task, &self.tokio_handle) {
+
+        let next_frame_at = graphics.last_frame_at + MIN_FRAME_INTERVAL;
+        if Instant::now() < next_frame_at {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame_at));
+            return;
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        // Polled every frame (rather than relying solely on `Moved`/`Resized`
+        // events) since window-manager position/size events around a
+        // fullscreen transition can race with the OS's own settling of the
+        // window rect, otherwise leaving these stuck at pre-transition values
+        // for a stray frame (or, if the racy event is the last one
+        // delivered, indefinitely) — which showed up as the touch trace being
+        // shifted and scaled wrong (e.g. window decorations disappearing and
+        // the window resizing to fill a differently-sized monitor on
+        // entering borderless fullscreen).
+        if let Ok(position) = graphics.subject.window.inner_position() {
+            *self.window_position.lock().unwrap() = (position.x, position.y);
+        }
+        let size = graphics.subject.window.inner_size();
+        *self.window_size.lock().unwrap() = (size.width, size.height);
+
+        graphics.last_frame_at = Instant::now();
+        if let Err(e) = graphics.render_frame(
+            &self.current_task,
+            &self.tokio_handle,
+            &self.touch_path,
+            &self.gaze_path,
+            &self.trial_counter,
+        ) {
             self.fail(event_loop, e);
         }
     }
@@ -303,16 +395,80 @@ impl Graphics {
             operator_descriptor_set_layout,
             upload_command_pool,
             fps: FpsCounter::new(),
+            last_frame_at: Instant::now(),
+            touch_path_cleared_at: Instant::now(),
+            last_trial_count: 0,
+            trace_opacity_percent: 100.0,
+            auto_clear: false,
+            show_touch: true,
+            show_gaze: true,
         })
     }
 
-    fn render_frame(&mut self, current_task: &SharedTask, tokio_handle: &tokio::runtime::Handle) -> Result<()> {
+    fn render_frame(
+        &mut self,
+        current_task: &SharedTask,
+        tokio_handle: &tokio::runtime::Handle,
+        touch_path: &SharedTouchPath,
+        gaze_path: &SharedGazePath,
+        trial_counter: &SharedTrialCounter,
+    ) -> Result<()> {
         self.fps.tick();
+
+        // A trial just ended (see `task_controller::run`, which bumps this
+        // counter once per finished trial rather than relying on a
+        // Some -> None transition of `current_task`, which could be missed
+        // if a new trial started before the next frame).
+        let trial_count = trial_counter.load(std::sync::atomic::Ordering::Relaxed);
+        if trial_count != self.last_trial_count {
+            self.last_trial_count = trial_count;
+            if self.auto_clear {
+                touch_path.lock().unwrap().clear();
+                gaze_path.lock().unwrap().clear();
+            }
+        }
+
+        // Touch and gaze paths are wiped together on the same clock (see
+        // `TOUCH_PATH_CLEAR_INTERVAL`), matching Thalamus's own
+        // `Canvas.__clear_periodically`.
+        let should_clear = self.touch_path_cleared_at.elapsed() >= TOUCH_PATH_CLEAR_INTERVAL;
+        if should_clear {
+            self.touch_path_cleared_at = Instant::now();
+        }
+
+        let touch_points = {
+            let mut points = touch_path.lock().unwrap();
+            if should_clear {
+                points.clear();
+            }
+            points.clone()
+        };
+        let gaze_points = {
+            let mut points = gaze_path.lock().unwrap();
+            if should_clear {
+                points.clear();
+            }
+            points.clone()
+        };
+
+        let no_points: Vec<(i32, i32)> = Vec::new();
+        let touch_points_shown = if self.show_touch { &touch_points } else { &no_points };
+        let gaze_points_shown = if self.show_gaze { &gaze_points } else { &no_points };
+        let trace_opacity = self.trace_opacity_percent / 100.0;
 
         let (subject_picture, operator_picture) =
             record_task_pictures(self.offscreen.extent, current_task, tokio_handle)?;
 
-        render_subject_frame(&self.base, &mut self.subject, &self.offscreen, &mut self.skia, subject_picture)?;
+        render_subject_frame(
+            &self.base,
+            &mut self.subject,
+            &self.offscreen,
+            &mut self.skia,
+            subject_picture,
+            touch_points_shown,
+            gaze_points_shown,
+            trace_opacity,
+        )?;
 
         // Acquired here (rather than right before the render pass below, as
         // before) so its command buffer is available to record the operator
@@ -324,6 +480,9 @@ impl Graphics {
             &self.operator_offscreen,
             &mut self.operator_skia,
             operator_picture,
+            touch_points_shown,
+            gaze_points_shown,
+            trace_opacity,
             frame.command_buffer,
         );
 
@@ -345,9 +504,10 @@ impl Graphics {
                 ui.text("Operator view:");
 
                 // Fit the operator image into the remaining space (minus room for the
-                // Clear button below it), preserving its aspect ratio and centering it.
+                // controls below it), preserving its aspect ratio and centering it.
+                const CONTROL_ROWS: f32 = 3.0;
                 let avail = ui.content_region_avail();
-                let avail = [avail[0].max(1.0), (avail[1] - ui.frame_height_with_spacing()).max(1.0)];
+                let avail = [avail[0].max(1.0), (avail[1] - CONTROL_ROWS * ui.frame_height_with_spacing()).max(1.0)];
                 let aspect_ratio =
                     self.operator_offscreen.extent.width as f32 / self.operator_offscreen.extent.height as f32;
                 let mut image_size = [avail[0], avail[0] / aspect_ratio];
@@ -364,8 +524,17 @@ impl Graphics {
                 imgui::Image::new(self.operator_texture_id, image_size).build(ui);
 
                 if ui.button("Clear") {
-                    // Intentionally a no-op for now.
+                    touch_path.lock().unwrap().clear();
+                    gaze_path.lock().unwrap().clear();
                 }
+                ui.same_line();
+                ui.checkbox("Auto Clear", &mut self.auto_clear);
+
+                ui.slider("Opacity", 0.0f32, 100.0f32, &mut self.trace_opacity_percent);
+
+                ui.checkbox("Show Touch", &mut self.show_touch);
+                ui.same_line();
+                ui.checkbox("Show Gaze", &mut self.show_gaze);
             });
         self.platform.prepare_render(ui, &self.operator.window);
         let draw_data = self.imgui.render();
@@ -477,14 +646,18 @@ fn record_task_pictures(
 }
 
 /// Draws the given (already-recorded subject-phase) picture into the subject
-/// offscreen target via Skia and blits it into the subject window's swapchain
-/// image.
+/// offscreen target via Skia — overlaid with the touch path (red dots) and
+/// gaze path (blue dots), same as the operator view — and blits it into the
+/// subject window's swapchain image.
 fn render_subject_frame(
     base: &VulkanBase,
     subject: &mut SwapchainWindow,
     offscreen: &OffscreenTarget,
     skia: &mut SkiaOffscreen,
     picture: Option<Picture>,
+    touch_points: &[(i32, i32)],
+    gaze_points: &[(i32, i32)],
+    trace_opacity: f32,
 ) -> Result<()> {
     let clear_color = Color4f::new(
         BLANK_CLEAR_COLOR[0],
@@ -497,6 +670,9 @@ fn render_subject_frame(
         if let Some(picture) = picture.as_ref() {
             canvas.draw_picture(picture, None, None);
         }
+
+        draw_dot_path(canvas, touch_points, TOUCH_DOT_COLOR, trace_opacity);
+        draw_dot_path(canvas, gaze_points, GAZE_DOT_COLOR, trace_opacity);
     });
     let layout_after_skia = skia.current_layout();
 
@@ -601,18 +777,45 @@ fn render_subject_frame(
     subject.end_frame(base, frame.image_index)
 }
 
+/// Draws the given points (already batched into a single `Path`/`draw_path`
+/// call rather than one `draw_circle` call per point) as filled dots of the
+/// given color, with `opacity` (0.0-1.0) applied on top of the color's own
+/// alpha. A no-op if `points` is empty.
+fn draw_dot_path(canvas: &skia_safe::Canvas, points: &[(i32, i32)], color: [f32; 4], opacity: f32) {
+    if points.is_empty() {
+        return;
+    }
+
+    let mut builder = PathBuilder::new();
+    for &(x, y) in points {
+        builder.add_circle((x as f32, y as f32), DOT_RADIUS, None);
+    }
+    let path = builder.detach();
+
+    let mut dot_paint = Paint::new(Color4f::new(color[0], color[1], color[2], color[3] * opacity), None);
+    dot_paint.set_anti_alias(true);
+    dot_paint.set_style(PaintStyle::Fill);
+    canvas.draw_path(&path, &dot_paint);
+}
+
 /// Draws the given (already-recorded operator-phase) picture into the
-/// operator offscreen target via Skia and transitions it for sampling by the
-/// operator window's imgui UI (see `Graphics::render_frame`), which displays
-/// it in an `imgui::Image`. Unlike the subject view, there's no swapchain
-/// blit here: `command_buffer` must be one already begun (via
-/// `SwapchainWindow::begin_frame`) but not yet in a render pass, since this
-/// records a pipeline barrier that a render pass can't contain.
+/// operator offscreen target via Skia, overlaid with the touch path (see
+/// `Graphics::render_frame`) as a path of red dots and the gaze path as a
+/// path of blue dots — same overlay as the subject view (see
+/// `render_subject_frame`). Transitions the result for sampling by the
+/// operator window's imgui UI, which displays it in an `imgui::Image`.
+/// Unlike the subject view, there's no swapchain blit here: `command_buffer`
+/// must be one already begun (via `SwapchainWindow::begin_frame`) but not yet
+/// in a render pass, since this records a pipeline barrier that a render
+/// pass can't contain.
 fn render_operator_offscreen(
     base: &VulkanBase,
     offscreen: &OffscreenTarget,
     skia: &mut SkiaOffscreen,
     picture: Option<Picture>,
+    touch_points: &[(i32, i32)],
+    gaze_points: &[(i32, i32)],
+    trace_opacity: f32,
     command_buffer: vk::CommandBuffer,
 ) {
     let clear_color = Color4f::new(
@@ -626,6 +829,9 @@ fn render_operator_offscreen(
         if let Some(picture) = picture.as_ref() {
             canvas.draw_picture(picture, None, None);
         }
+
+        draw_dot_path(canvas, touch_points, TOUCH_DOT_COLOR, trace_opacity);
+        draw_dot_path(canvas, gaze_points, GAZE_DOT_COLOR, trace_opacity);
     });
     let layout_after_skia = skia.current_layout();
 
