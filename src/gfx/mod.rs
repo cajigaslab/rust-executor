@@ -11,7 +11,7 @@ use imgui_rs_vulkan_renderer::vulkan::{
 };
 use imgui_rs_vulkan_renderer::{Options, Renderer};
 use imgui_winit_support::WinitPlatform;
-use skia_safe::{Color4f, PictureRecorder, Rect};
+use skia_safe::{Color4f, Picture, PictureRecorder, Rect};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -20,21 +20,28 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{WindowAttributes, WindowId};
 
-use crate::behavior_task::SharedTask;
+use crate::behavior_task::{SharedTask, Window};
 use crate::touch_screen::SharedWindowPosition;
 use base::VulkanBase;
 use offscreen::OffscreenTarget;
 use skia_offscreen::SkiaOffscreen;
 use window_target::{SwapchainWindow, MAX_FRAMES_IN_FLIGHT};
 
-/// Background color for both the subject view and its copy in the operator
-/// window, so a blank subject scene reads as blank in both places.
+/// Background color for both views, so a blank scene reads as blank in both
+/// places.
 const BLANK_CLEAR_COLOR: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 
-const SUBJECT_EXTENT: vk::Extent2D = vk::Extent2D {
+/// Resolution of both offscreen render targets (subject and operator).
+const OFFSCREEN_EXTENT: vk::Extent2D = vk::Extent2D {
     width: 1280,
     height: 720,
 };
+
+/// Upper bound on the render loop's throughput. Without this, `ControlFlow::Poll`
+/// drives the loop as fast as the GPU/CPU allow, burning a full core for no
+/// visible benefit past what either window can present.
+const MAX_FPS: u32 = 1000;
+const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / MAX_FPS as u64);
 
 /// Tracks the render loop's throughput, updating an averaged reading twice a
 /// second rather than every frame (which at an uncapped framerate would just
@@ -97,14 +104,19 @@ struct Graphics {
     operator: SwapchainWindow,
     offscreen: OffscreenTarget,
     skia: SkiaOffscreen,
+    operator_offscreen: OffscreenTarget,
+    operator_skia: SkiaOffscreen,
     imgui: imgui::Context,
     platform: WinitPlatform,
     renderer: Renderer,
-    subject_texture_id: imgui::TextureId,
-    subject_descriptor_pool: vk::DescriptorPool,
-    subject_descriptor_set_layout: vk::DescriptorSetLayout,
+    operator_texture_id: imgui::TextureId,
+    operator_descriptor_pool: vk::DescriptorPool,
+    operator_descriptor_set_layout: vk::DescriptorSetLayout,
     upload_command_pool: vk::CommandPool,
     fps: FpsCounter,
+    /// When the last frame was rendered, so `App::about_to_wait` can pace the
+    /// loop to [`MAX_FPS`].
+    last_frame_at: Instant,
 }
 
 struct App {
@@ -199,7 +211,7 @@ impl Graphics {
         let subject_window = event_loop.create_window(
             WindowAttributes::default()
                 .with_title("Subject")
-                .with_inner_size(LogicalSize::new(SUBJECT_EXTENT.width, SUBJECT_EXTENT.height))
+                .with_inner_size(LogicalSize::new(OFFSCREEN_EXTENT.width, OFFSCREEN_EXTENT.height))
                 .with_resizable(true),
         )?;
         let operator_window = event_loop.create_window(
@@ -216,10 +228,14 @@ impl Graphics {
         let subject = SwapchainWindow::new(&base, subject_window, subject_surface)?;
         let operator = SwapchainWindow::new(&base, operator_window, operator_surface)?;
 
-        let offscreen = OffscreenTarget::new(&base, SUBJECT_EXTENT)?;
+        let offscreen = OffscreenTarget::new(&base, OFFSCREEN_EXTENT)?;
         // Safety: `base` and `offscreen` outlive `skia`, both held in this same
         // `Graphics` struct and dropped only in `Graphics::destroy`.
         let skia = unsafe { SkiaOffscreen::new(&base, &offscreen)? };
+
+        let operator_offscreen = OffscreenTarget::new(&base, OFFSCREEN_EXTENT)?;
+        // Safety: same as `skia` above, for `operator_offscreen`.
+        let operator_skia = unsafe { SkiaOffscreen::new(&base, &operator_offscreen)? };
 
         let mut imgui = imgui::Context::create();
         imgui.set_ini_filename(None);
@@ -257,18 +273,19 @@ impl Graphics {
             }),
         )?;
 
-        // A texture the operator's imgui UI can display: the same offscreen image
-        // the subject window presents, so both views always show the same content.
-        let subject_descriptor_set_layout = create_vulkan_descriptor_set_layout(&base.device)?;
-        let subject_descriptor_pool = create_vulkan_descriptor_pool(&base.device, 1)?;
-        let subject_descriptor_set = create_vulkan_descriptor_set(
+        // A texture the operator's imgui UI can display: the operator-phase
+        // offscreen image, rendered separately from the subject view (see
+        // `Graphics::render_frame`).
+        let operator_descriptor_set_layout = create_vulkan_descriptor_set_layout(&base.device)?;
+        let operator_descriptor_pool = create_vulkan_descriptor_pool(&base.device, 1)?;
+        let operator_descriptor_set = create_vulkan_descriptor_set(
             &base.device,
-            subject_descriptor_set_layout,
-            subject_descriptor_pool,
-            offscreen.view,
-            offscreen.sampler,
+            operator_descriptor_set_layout,
+            operator_descriptor_pool,
+            operator_offscreen.view,
+            operator_offscreen.sampler,
         )?;
-        let subject_texture_id = renderer.textures().insert(subject_descriptor_set);
+        let operator_texture_id = renderer.textures().insert(operator_descriptor_set);
 
         Ok(Self {
             base,
@@ -276,12 +293,14 @@ impl Graphics {
             operator,
             offscreen,
             skia,
+            operator_offscreen,
+            operator_skia,
             imgui,
             platform,
             renderer,
-            subject_texture_id,
-            subject_descriptor_pool,
-            subject_descriptor_set_layout,
+            operator_texture_id,
+            operator_descriptor_pool,
+            operator_descriptor_set_layout,
             upload_command_pool,
             fps: FpsCounter::new(),
         })
@@ -289,14 +308,24 @@ impl Graphics {
 
     fn render_frame(&mut self, current_task: &SharedTask, tokio_handle: &tokio::runtime::Handle) -> Result<()> {
         self.fps.tick();
-        render_subject_frame(
+
+        let (subject_picture, operator_picture) =
+            record_task_pictures(self.offscreen.extent, current_task, tokio_handle)?;
+
+        render_subject_frame(&self.base, &mut self.subject, &self.offscreen, &mut self.skia, subject_picture)?;
+
+        // Acquired here (rather than right before the render pass below, as
+        // before) so its command buffer is available to record the operator
+        // offscreen's post-render layout transition ahead of the render pass
+        // that samples it.
+        let frame = self.operator.begin_frame(&self.base)?;
+        render_operator_offscreen(
             &self.base,
-            &mut self.subject,
-            &self.offscreen,
-            &mut self.skia,
-            current_task,
-            tokio_handle,
-        )?;
+            &self.operator_offscreen,
+            &mut self.operator_skia,
+            operator_picture,
+            frame.command_buffer,
+        );
 
         self.platform
             .prepare_frame(self.imgui.io_mut(), &self.operator.window)?;
@@ -313,14 +342,14 @@ impl Graphics {
             )
             .build(|| {
                 ui.text(format!("FPS: {:.0}", self.fps.fps));
-                ui.text("Subject view:");
+                ui.text("Operator view:");
 
-                // Fit the subject image into the remaining space (minus room for the
+                // Fit the operator image into the remaining space (minus room for the
                 // Clear button below it), preserving its aspect ratio and centering it.
                 let avail = ui.content_region_avail();
                 let avail = [avail[0].max(1.0), (avail[1] - ui.frame_height_with_spacing()).max(1.0)];
                 let aspect_ratio =
-                    self.offscreen.extent.width as f32 / self.offscreen.extent.height as f32;
+                    self.operator_offscreen.extent.width as f32 / self.operator_offscreen.extent.height as f32;
                 let mut image_size = [avail[0], avail[0] / aspect_ratio];
                 if image_size[1] > avail[1] {
                     image_size = [avail[1] * aspect_ratio, avail[1]];
@@ -332,7 +361,7 @@ impl Graphics {
                     ui.set_cursor_pos([cursor_x + offset_x, cursor_y]);
                 }
 
-                imgui::Image::new(self.subject_texture_id, image_size).build(ui);
+                imgui::Image::new(self.operator_texture_id, image_size).build(ui);
 
                 if ui.button("Clear") {
                     // Intentionally a no-op for now.
@@ -341,7 +370,6 @@ impl Graphics {
         self.platform.prepare_render(ui, &self.operator.window);
         let draw_data = self.imgui.render();
 
-        let frame = self.operator.begin_frame(&self.base)?;
         unsafe {
             let clear_values = [vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -376,10 +404,10 @@ impl Graphics {
             let _ = self.base.device.device_wait_idle();
             self.base
                 .device
-                .destroy_descriptor_pool(self.subject_descriptor_pool, None);
+                .destroy_descriptor_pool(self.operator_descriptor_pool, None);
             self.base
                 .device
-                .destroy_descriptor_set_layout(self.subject_descriptor_set_layout, None);
+                .destroy_descriptor_set_layout(self.operator_descriptor_set_layout, None);
             self.base
                 .device
                 .destroy_command_pool(self.upload_command_pool, None);
@@ -388,7 +416,9 @@ impl Graphics {
         // context's Drop impls destroy their own Vulkan objects on this device.
         drop(self.renderer);
         drop(self.skia);
+        drop(self.operator_skia);
         self.offscreen.destroy(&self.base);
+        self.operator_offscreen.destroy(&self.base);
         self.subject.destroy(&self.base);
         self.operator.destroy(&self.base);
         unsafe {
@@ -417,16 +447,44 @@ fn image_subresource_range() -> vk::ImageSubresourceRange {
     }
 }
 
-/// Draws the shared offscreen "subject view" target via Skia (a blank scene, or
-/// the growing arc while a "simple" task is running) and blits it into the
-/// subject window's swapchain image.
+/// Renders the current task (if any) for both views via `spawn_blocking`,
+/// recording each into a `Picture` rather than drawing on Skia's live canvas
+/// directly: a borrowed `&Canvas` tied to a frame's surface can't cross the
+/// `spawn_blocking` closure's `'static` boundary, but an owned `Picture` can
+/// (and is `Send`), so each is replayed onto the real canvas back on this
+/// thread afterwards (see `render_subject_frame`/`render_operator_offscreen`).
+/// Rendered in this order — subject phase, then operator phase — per
+/// [`crate::behavior_task::BehaviorTask`]'s two-phase contract.
+fn record_task_pictures(
+    extent: vk::Extent2D,
+    current_task: &SharedTask,
+    tokio_handle: &tokio::runtime::Handle,
+) -> Result<(Option<Picture>, Option<Picture>)> {
+    let task = current_task.lock().unwrap().clone();
+    let (width, height) = (extent.width as f32, extent.height as f32);
+    let join = tokio_handle.spawn_blocking(move || {
+        let record = |window: Window| {
+            let mut recorder = PictureRecorder::new();
+            let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, width, height), false);
+            if let Some(task) = task.as_ref() {
+                task.render(canvas, window);
+            }
+            recorder.finish_recording_as_picture(None)
+        };
+        (record(Window::Subject), record(Window::Operator))
+    });
+    Ok(tokio_handle.block_on(join)?)
+}
+
+/// Draws the given (already-recorded subject-phase) picture into the subject
+/// offscreen target via Skia and blits it into the subject window's swapchain
+/// image.
 fn render_subject_frame(
     base: &VulkanBase,
     subject: &mut SwapchainWindow,
     offscreen: &OffscreenTarget,
     skia: &mut SkiaOffscreen,
-    current_task: &SharedTask,
-    tokio_handle: &tokio::runtime::Handle,
+    picture: Option<Picture>,
 ) -> Result<()> {
     let clear_color = Color4f::new(
         BLANK_CLEAR_COLOR[0],
@@ -434,24 +492,6 @@ fn render_subject_frame(
         BLANK_CLEAR_COLOR[2],
         BLANK_CLEAR_COLOR[3],
     );
-
-    // The current task (if any) is rendered via `spawn_blocking`, recording
-    // into a `Picture` rather than drawing on Skia's live canvas directly: a
-    // borrowed `&Canvas` tied to this frame's surface can't cross the
-    // `spawn_blocking` closure's `'static` boundary, but an owned `Picture`
-    // can (and is `Send`), so we replay it onto the real canvas back on this
-    // thread afterwards.
-    let task = current_task.lock().unwrap().clone();
-    let (width, height) = (offscreen.extent.width as f32, offscreen.extent.height as f32);
-    let join = tokio_handle.spawn_blocking(move || {
-        let mut recorder = PictureRecorder::new();
-        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, width, height), false);
-        if let Some(task) = task.as_ref() {
-            task.render(canvas);
-        }
-        recorder.finish_recording_as_picture(None)
-    });
-    let picture = tokio_handle.block_on(join)?;
 
     skia.render(clear_color, |canvas| {
         if let Some(picture) = picture.as_ref() {
@@ -559,4 +599,45 @@ fn render_subject_frame(
     skia.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     subject.end_frame(base, frame.image_index)
+}
+
+/// Draws the given (already-recorded operator-phase) picture into the
+/// operator offscreen target via Skia and transitions it for sampling by the
+/// operator window's imgui UI (see `Graphics::render_frame`), which displays
+/// it in an `imgui::Image`. Unlike the subject view, there's no swapchain
+/// blit here: `command_buffer` must be one already begun (via
+/// `SwapchainWindow::begin_frame`) but not yet in a render pass, since this
+/// records a pipeline barrier that a render pass can't contain.
+fn render_operator_offscreen(
+    base: &VulkanBase,
+    offscreen: &OffscreenTarget,
+    skia: &mut SkiaOffscreen,
+    picture: Option<Picture>,
+    command_buffer: vk::CommandBuffer,
+) {
+    let clear_color = Color4f::new(
+        BLANK_CLEAR_COLOR[0],
+        BLANK_CLEAR_COLOR[1],
+        BLANK_CLEAR_COLOR[2],
+        BLANK_CLEAR_COLOR[3],
+    );
+
+    skia.render(clear_color, |canvas| {
+        if let Some(picture) = picture.as_ref() {
+            canvas.draw_picture(picture, None, None);
+        }
+    });
+    let layout_after_skia = skia.current_layout();
+
+    // See the equivalent barrier in `render_subject_frame` for why the src
+    // stage/access is deliberately wide.
+    offscreen.transition(
+        base,
+        command_buffer,
+        layout_after_skia,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_WRITE),
+        (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ),
+    );
+    skia.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 }
