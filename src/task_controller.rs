@@ -1,14 +1,18 @@
+use crate::behavior_task::{self, SharedTask};
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::pb::task_controller_grpc::{TaskConfig, TaskResult};
 use serde_json::Value;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-/// Drives the `execution` stream: for every `TaskConfig` the server sends, print
-/// its `task_type`, sleep for a second, then report a successful `TaskResult` back
-/// on the same stream.
-pub async fn run(addr: String) -> anyhow::Result<()> {
+/// Drives the `execution` stream: for every `TaskConfig` the server sends,
+/// look up its `task_type` in the `BehaviorTask` registry, run that task
+/// (installing it as the current task so the render thread can draw its
+/// progress for as long as it runs, then dropping it once done), and report a
+/// successful `TaskResult` back on the same stream.
+pub async fn run(addr: String, current_task: SharedTask) -> anyhow::Result<()> {
+    let registry = behavior_task::registry();
+
     let mut client = TaskControllerClient::connect(addr.clone()).await?;
 
     let (tx, rx) = mpsc::channel::<TaskResult>(8);
@@ -19,9 +23,20 @@ pub async fn run(addr: String) -> anyhow::Result<()> {
     let mut inbound = response.into_inner();
 
     while let Some(config) = inbound.message().await? {
-        println!("task_type: {}", task_type_of(&config));
+        let task_type = task_type_of(&config);
+        println!("task_type: {task_type}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        match registry.get(&task_type) {
+            Some(factory) => {
+                let task = factory();
+                *current_task.lock().unwrap() = Some(task.clone());
+                task.run().await;
+                *current_task.lock().unwrap() = None;
+            }
+            None => {
+                tracing::warn!("no BehaviorTask registered for task_type {task_type:?}");
+            }
+        }
 
         let result = TaskResult {
             success: true,

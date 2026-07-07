@@ -1,8 +1,11 @@
+mod behavior_task;
 mod gfx;
 mod pb;
 mod state;
 mod task_controller;
+mod touch_screen;
 
+use behavior_task::SharedTask;
 use pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use pb::thalamus_grpc::{ObservableChange, ObservableTransaction};
 use serde_json::Value;
@@ -20,9 +23,18 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50050".to_string());
 
+    let current_task = behavior_task::shared_task();
+    let window_position = touch_screen::shared_window_position();
+
     // The Thalamus/TaskController gRPC clients run on a background thread with
     // their own Tokio runtime; the windowing/Vulkan render loop below needs the
-    // main thread to itself on most platforms.
+    // main thread to itself on most platforms. The render loop invokes
+    // `BehaviorTask::render` via that runtime's `spawn_blocking` + `block_on`
+    // (see `gfx::render_subject_frame`), so the grpc thread sends a `Handle` to
+    // it back once it's built.
+    let grpc_current_task = current_task.clone();
+    let grpc_window_position = window_position.clone();
+    let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("grpc".to_string())
         .spawn(move || {
@@ -33,15 +45,24 @@ fn main() -> anyhow::Result<()> {
                     return;
                 }
             };
-            if let Err(e) = runtime.block_on(run_grpc(addr)) {
+            let _ = handle_tx.send(runtime.handle().clone());
+            if let Err(e) = runtime.block_on(run_grpc(addr, grpc_current_task, grpc_window_position)) {
                 tracing::error!("gRPC client task ended: {e}");
             }
         })?;
 
-    gfx::run()
+    let tokio_handle = handle_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("grpc thread exited before it started its Tokio runtime"))?;
+
+    gfx::run(current_task, tokio_handle, window_position)
 }
 
-async fn run_grpc(mut addr: String) -> anyhow::Result<()> {
+async fn run_grpc(mut addr: String, current_task: SharedTask, window_position: touch_screen::SharedWindowPosition) -> anyhow::Result<()> {
+    // The TOUCH_SCREEN analog stream connects to this original address, not
+    // wherever observable_bridge_v2 ends up redirecting to below.
+    let unredirected_addr = addr.clone();
+
     let mut app_state = Value::Object(Default::default());
 
     // Resolve the observable_bridge_v2 stream, following a redirect if the first
@@ -92,9 +113,15 @@ async fn run_grpc(mut addr: String) -> anyhow::Result<()> {
     // if any) do we connect the TaskController's execution stream, to the same
     // resolved address.
     let task_controller_addr = addr.clone();
+    let touch_current_task = current_task.clone();
     tokio::spawn(async move {
-        if let Err(e) = task_controller::run(task_controller_addr).await {
+        if let Err(e) = task_controller::run(task_controller_addr, current_task).await {
             tracing::error!("task controller execution stream failed: {e}");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = touch_screen::run(unredirected_addr, touch_current_task, window_position).await {
+            tracing::error!("touch screen analog stream failed: {e}");
         }
     });
 

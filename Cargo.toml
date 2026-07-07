@@ -21,6 +21,8 @@ gpu-allocator = "0.27"
 imgui = "0.12"
 imgui-rs-vulkan-renderer = { version = "1.16", features = ["gpu-allocator"] }
 imgui-winit-support = "0.13"
+skia-safe = { version = "0.99", features = ["gpu", "vulkan"] }
+async-trait = "0.1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
