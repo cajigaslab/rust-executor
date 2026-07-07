@@ -1,3 +1,4 @@
+mod gfx;
 mod pb;
 mod state;
 mod task_controller;
@@ -12,24 +13,46 @@ use tokio_stream::wrappers::ReceiverStream;
 /// if two nodes redirect to each other.
 const MAX_REDIRECTS: u32 = 8;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let mut addr = std::env::args()
+    let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50050".to_string());
 
+    // The Thalamus/TaskController gRPC clients run on a background thread with
+    // their own Tokio runtime; the windowing/Vulkan render loop below needs the
+    // main thread to itself on most platforms.
+    std::thread::Builder::new()
+        .name("grpc".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    tracing::error!("failed to start Tokio runtime: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = runtime.block_on(run_grpc(addr)) {
+                tracing::error!("gRPC client task ended: {e}");
+            }
+        })?;
+
+    gfx::run()
+}
+
+async fn run_grpc(mut addr: String) -> anyhow::Result<()> {
     let mut app_state = Value::Object(Default::default());
 
     // Resolve the observable_bridge_v2 stream, following a redirect if the first
     // (and, per Thalamus's server, only ever the first) message carries one. See
     // `Service::observable_bridge_v2` in grpc_impl.cpp.
     let mut inbound = None;
-    // Kept alive for the rest of `main` once resolved below: dropping the sender
-    // closes our half of the bidi stream, which makes the server end the whole
-    // RPC (see the `while (stream->Read(&in))` loop in `Service::observable_bridge_v2`
-    // in grpc_impl.cpp) even though we never send anything on it.
+    // Kept alive for the rest of this function once resolved below: dropping the
+    // sender closes our half of the bidi stream, which makes the server end the
+    // whole RPC (see the `while (stream->Read(&in))` loop in
+    // `Service::observable_bridge_v2` in grpc_impl.cpp) even though we never send
+    // anything on it.
     let mut outbound_keepalive = None;
     for _ in 0..MAX_REDIRECTS {
         let channel = tonic::transport::Channel::from_shared(addr.clone())?
