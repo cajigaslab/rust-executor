@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package util_grpc;
+option java_package = "org.pesaran.thalamus";
+
+message Empty {
+}
+
+message Header {
+  uint64 stamp = 1;
+}

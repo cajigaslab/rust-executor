@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+import "util.proto";
+
+package task_controller_grpc;
+
+message Empty {
+}
+
+// The greeting service definition.
+service TaskController {
+  // Sends multiple greetings
+  rpc execution (stream TaskResult) returns (stream TaskConfig) {}
+  rpc trial_summary (Empty) returns (stream TrialSummary) {}
+  rpc state (Empty) returns (stream BehavState) {}
+  rpc start_execution (Empty) returns (Empty) {}
+  rpc stop_execution (Empty) returns (Empty) {}
+}
+
+message TaskConfig {
+  string body = 1;
+}
+
+message TaskResult {
+  bool success = 1;
+  bool cancelled = 2;
+}
+
+message TrialSummary {
+  util_grpc.Header header = 1;
+  string used_values = 2;
+  string task_config = 3;
+  string task_result = 4;
+  string behav_result = 5;
+}
+
+message BehavState {
+  string state = 1;
+}
