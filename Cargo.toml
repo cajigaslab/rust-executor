@@ -23,6 +23,11 @@ imgui-rs-vulkan-renderer = { version = "1.16", features = ["gpu-allocator"] }
 imgui-winit-support = "0.13"
 skia-safe = { version = "0.99", features = ["gpu", "vulkan"] }
 async-trait = "0.1"
+kira = "0.12.1"
+rand = "0.10.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -16,7 +16,7 @@ const TOUCH_SCREEN_NODE_TYPE: &str = "TOUCH_SCREEN";
 pub type SharedWindowPosition = Arc<Mutex<(i32, i32)>>;
 
 pub fn shared_window_position() -> SharedWindowPosition {
-    Arc::new(Mutex::new((0, 0)))
+  Arc::new(Mutex::new((0, 0)))
 }
 
 /// The subject window's current inner size, in physical pixels — kept up to
@@ -31,7 +31,7 @@ pub fn shared_window_position() -> SharedWindowPosition {
 pub type SharedWindowSize = Arc<Mutex<(u32, u32)>>;
 
 pub fn shared_window_size() -> SharedWindowSize {
-    Arc::new(Mutex::new((crate::canvas::WIDTH, crate::canvas::HEIGHT)))
+  Arc::new(Mutex::new((crate::canvas::WIDTH, crate::canvas::HEIGHT)))
 }
 
 /// Touch points received since the last periodic clear (see
@@ -41,7 +41,7 @@ pub fn shared_window_size() -> SharedWindowSize {
 pub type SharedTouchPath = Arc<Mutex<Vec<(i32, i32)>>>;
 
 pub fn shared_touch_path() -> SharedTouchPath {
-    Arc::new(Mutex::new(Vec::new()))
+  Arc::new(Mutex::new(Vec::new()))
 }
 
 /// Streams touch input from Thalamus's `analog` RPC for the TOUCH_SCREEN node
@@ -53,44 +53,46 @@ pub fn shared_touch_path() -> SharedTouchPath {
 /// (if any), as well as appending it to `touch_path` for the operator view's
 /// touch overlay.
 pub async fn run(
-    mut client: ThalamusClient<Channel>,
-    current_task: SharedTask,
-    window_position: SharedWindowPosition,
-    window_size: SharedWindowSize,
-    touch_path: SharedTouchPath,
+  mut client: ThalamusClient<Channel>,
+  current_task: SharedTask,
+  window_position: SharedWindowPosition,
+  window_size: SharedWindowSize,
+  touch_path: SharedTouchPath,
 ) -> anyhow::Result<()> {
-    let request = AnalogRequest {
-        node: Some(NodeSelector {
-            name: String::new(),
-            r#type: TOUCH_SCREEN_NODE_TYPE.to_string(),
-        }),
-        channels: Vec::new(),
-        channel_names: Vec::new(),
+  let request = AnalogRequest {
+    node: Some(NodeSelector {
+      name: String::new(),
+      r#type: TOUCH_SCREEN_NODE_TYPE.to_string(),
+    }),
+    channels: Vec::new(),
+    channel_names: Vec::new(),
+  };
+
+  tracing::info!("connecting to TOUCH_SCREEN analog stream");
+  let response = client.analog(request).await?;
+  let mut inbound = response.into_inner();
+
+  while let Some(analog) = inbound.message().await? {
+    let (Some(x), Some(y)) = (last_span_value(&analog, "X"), last_span_value(&analog, "Y")) else {
+      // Either component is missing from this message: skip it.
+      continue;
     };
 
-    tracing::info!("connecting to TOUCH_SCREEN analog stream");
-    let response = client.analog(request).await?;
-    let mut inbound = response.into_inner();
+    let (window_x, window_y) = *window_position.lock().unwrap();
+    let (window_width, window_height) = *window_size.lock().unwrap();
 
-    while let Some(analog) = inbound.message().await? {
-        let (Some(x), Some(y)) = (last_span_value(&analog, "X"), last_span_value(&analog, "Y")) else {
-            // Either component is missing from this message: skip it.
-            continue;
-        };
+    let local_x = x - window_x as f64;
+    let local_y = y - window_y as f64;
+    let canvas_x =
+      (local_x * crate::canvas::WIDTH as f64 / window_width.max(1) as f64).round() as i32;
+    let canvas_y =
+      (local_y * crate::canvas::HEIGHT as f64 / window_height.max(1) as f64).round() as i32;
 
-        let (window_x, window_y) = *window_position.lock().unwrap();
-        let (window_width, window_height) = *window_size.lock().unwrap();
-
-        let local_x = x - window_x as f64;
-        let local_y = y - window_y as f64;
-        let canvas_x = (local_x * crate::canvas::WIDTH as f64 / window_width.max(1) as f64).round() as i32;
-        let canvas_y = (local_y * crate::canvas::HEIGHT as f64 / window_height.max(1) as f64).round() as i32;
-
-        if let Some(task) = current_task.lock().unwrap().as_ref() {
-            task.on_touch(canvas_x, canvas_y);
-        }
-        touch_path.lock().unwrap().push((canvas_x, canvas_y));
+    if let Some(task) = current_task.lock().unwrap().as_ref() {
+      task.on_touch(canvas_x, canvas_y);
     }
+    touch_path.lock().unwrap().push((canvas_x, canvas_y));
+  }
 
-    Ok(())
+  Ok(())
 }
