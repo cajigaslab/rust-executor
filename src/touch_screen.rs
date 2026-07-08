@@ -21,13 +21,12 @@ pub fn shared_window_position() -> SharedWindowPosition {
 
 /// The subject window's current inner size, in physical pixels — kept up to
 /// date by `gfx::App::about_to_wait` (polled every frame, same as
-/// [`SharedWindowPosition`]) — so touch points, reported in absolute desktop
-/// physical pixels, can be rescaled from window-local physical pixels into
-/// the fixed [`crate::canvas`] space that `BehaviorTask::render` draws into.
-/// Without this, touch points are only correct when the window's actual
-/// physical size happens to match the canvas size (e.g. windowed at 100% DPI
-/// scaling) and appear scaled everywhere else (e.g. fullscreen on a
-/// differently-sized monitor).
+/// [`SharedWindowPosition`]). Used by `eye_tracking::run` (gaze reports are
+/// relative to screen center, so it needs the window's current size to find
+/// that center); `touch_screen::run` doesn't need it, since touch points are
+/// already in the same window-local physical-pixel space `BehaviorTask::render`
+/// draws into (the offscreen targets track the subject window's actual size —
+/// see `gfx::Graphics::resize_offscreen_targets_if_needed`).
 pub type SharedWindowSize = Arc<Mutex<(u32, u32)>>;
 
 pub fn shared_window_size() -> SharedWindowSize {
@@ -48,15 +47,14 @@ pub fn shared_touch_path() -> SharedTouchPath {
 /// over `client` (shared with `eye_tracking::run`, since both just hit the
 /// same service's `analog` RPC for different node types) and forwards each
 /// touch point — translated from screen coordinates to window-local physical
-/// pixels, then rescaled into `crate::canvas` space (see
-/// [`SharedWindowSize`]) — to whichever `BehaviorTask` is currently running
-/// (if any), as well as appending it to `touch_path` for the operator view's
-/// touch overlay.
+/// pixels (the same space `BehaviorTask::render` draws into — no further
+/// rescaling needed, see [`SharedWindowSize`]'s doc comment) — to whichever
+/// `BehaviorTask` is currently running (if any), as well as appending it to
+/// `touch_path` for the operator view's touch overlay.
 pub async fn run(
   mut client: ThalamusClient<Channel>,
   current_task: SharedTask,
   window_position: SharedWindowPosition,
-  window_size: SharedWindowSize,
   touch_path: SharedTouchPath,
 ) -> anyhow::Result<()> {
   let request = AnalogRequest {
@@ -79,14 +77,8 @@ pub async fn run(
     };
 
     let (window_x, window_y) = *window_position.lock().unwrap();
-    let (window_width, window_height) = *window_size.lock().unwrap();
-
-    let local_x = x - window_x as f64;
-    let local_y = y - window_y as f64;
-    let canvas_x =
-      (local_x * crate::canvas::WIDTH as f64 / window_width.max(1) as f64).round() as i32;
-    let canvas_y =
-      (local_y * crate::canvas::HEIGHT as f64 / window_height.max(1) as f64).round() as i32;
+    let canvas_x = (x - window_x as f64).round() as i32;
+    let canvas_y = (y - window_y as f64).round() as i32;
 
     if let Some(task) = current_task.lock().unwrap().as_ref() {
       task.on_touch(canvas_x, canvas_y);

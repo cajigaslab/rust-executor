@@ -34,9 +34,11 @@ use window_target::{MAX_FRAMES_IN_FLIGHT, SwapchainWindow};
 /// places.
 const BLANK_CLEAR_COLOR: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 
-/// Resolution of both offscreen render targets (subject and operator).
-/// Backed by `crate::canvas`, the fixed canvas space touch/gaze input is
-/// also rescaled into.
+/// Initial resolution of both offscreen render targets — backed by
+/// `crate::canvas`, the fixed canvas space touch/gaze input is rescaled
+/// into. Neither stays at this size past the first frame — see
+/// `Graphics::resize_offscreen_targets_if_needed` — since both are kept in
+/// sync with the subject window's actual size instead.
 const OFFSCREEN_EXTENT: vk::Extent2D = vk::Extent2D {
   width: crate::canvas::WIDTH,
   height: crate::canvas::HEIGHT,
@@ -422,6 +424,79 @@ impl Graphics {
     })
   }
 
+  /// (Re)creates both `self.offscreen`/`self.skia` and
+  /// `self.operator_offscreen`/`self.operator_skia` at the subject window's
+  /// current physical size whenever it's changed, so the two offscreen
+  /// targets always match the subject window (and, since both are always
+  /// resized together here, each other) instead of a fixed resolution — a
+  /// per-frame poll (like `App::about_to_wait`'s position/size tracking)
+  /// rather than reacting to `WindowEvent::Resized`, for the same reason:
+  /// resize events can race with the window manager still settling the
+  /// window rect. A no-op most frames, once the sizes already match.
+  fn resize_offscreen_targets_if_needed(&mut self) -> Result<()> {
+    let physical_size = self.subject.window.inner_size();
+    if physical_size.width == 0 || physical_size.height == 0 {
+      // Minimized (or not yet mapped): keep the existing targets rather
+      // than creating zero-sized images.
+      return Ok(());
+    }
+    let new_extent = vk::Extent2D {
+      width: physical_size.width,
+      height: physical_size.height,
+    };
+    if new_extent == self.offscreen.extent {
+      return Ok(());
+    }
+
+    // The old offscreen images may still be read by in-flight GPU work (the
+    // subject blit / operator imgui sampling from a still-outstanding
+    // frame), so make sure the GPU is done with them before destroying —
+    // and before overwriting the operator descriptor set below, which the
+    // GPU may also still be reading from.
+    unsafe { self.base.device.device_wait_idle()? };
+
+    let new_offscreen = OffscreenTarget::new(&self.base, new_extent)?;
+    // Safety: same as `Graphics::new`'s construction of `skia` — `base` and
+    // `new_offscreen` both outlive it, held in this same `Graphics` struct.
+    let new_skia = unsafe { SkiaOffscreen::new(&self.base, &new_offscreen)? };
+    let new_operator_offscreen = OffscreenTarget::new(&self.base, new_extent)?;
+    let new_operator_skia = unsafe { SkiaOffscreen::new(&self.base, &new_operator_offscreen)? };
+
+    // The imgui texture the operator UI displays points at the *old*
+    // operator offscreen's view/sampler; repoint it at the new one in place
+    // (same descriptor set, same `operator_texture_id`) rather than
+    // reallocating from `operator_descriptor_pool` (sized for exactly one
+    // set) or changing the id the UI code references.
+    let descriptor_set = *self
+      .renderer
+      .textures()
+      .get(self.operator_texture_id)
+      .expect("operator_texture_id should always resolve to a descriptor set");
+    let image_info = [vk::DescriptorImageInfo {
+      sampler: new_operator_offscreen.sampler,
+      image_view: new_operator_offscreen.view,
+      image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    }];
+    let writes = [vk::WriteDescriptorSet::default()
+      .dst_set(descriptor_set)
+      .dst_binding(0)
+      .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+      .image_info(&image_info)];
+    unsafe { self.base.device.update_descriptor_sets(&writes, &[]) };
+
+    let old_offscreen = std::mem::replace(&mut self.offscreen, new_offscreen);
+    let old_skia = std::mem::replace(&mut self.skia, new_skia);
+    let old_operator_offscreen =
+      std::mem::replace(&mut self.operator_offscreen, new_operator_offscreen);
+    let old_operator_skia = std::mem::replace(&mut self.operator_skia, new_operator_skia);
+    drop(old_skia);
+    drop(old_operator_skia);
+    old_offscreen.destroy(&self.base);
+    old_operator_offscreen.destroy(&self.base);
+
+    Ok(())
+  }
+
   fn render_frame(
     &mut self,
     current_task: &SharedTask,
@@ -430,6 +505,7 @@ impl Graphics {
     gaze_path: &SharedGazePath,
     trial_counter: &SharedTrialCounter,
   ) -> Result<()> {
+    self.resize_offscreen_targets_if_needed()?;
     self.fps.tick();
 
     // A trial just ended (see `task_controller::run`, which bumps this
@@ -552,6 +628,10 @@ impl Graphics {
 
         imgui::Image::new(self.operator_texture_id, image_size).build(ui);
 
+        if let Some(task) = current_task.lock().unwrap().as_ref() {
+          task.operator_widget(ui);
+        }
+
         if ui.button("Clear") {
           touch_path.lock().unwrap().clear();
           gaze_path.lock().unwrap().clear();
@@ -655,7 +735,11 @@ fn image_subresource_range() -> vk::ImageSubresourceRange {
 /// (and is `Send`), so each is replayed onto the real canvas back on this
 /// thread afterwards (see `render_subject_frame`/`render_operator_offscreen`).
 /// Rendered in this order — subject phase, then operator phase — per
-/// [`crate::behavior_task::BehaviorTask`]'s two-phase contract.
+/// [`crate::behavior_task::BehaviorTask`]'s two-phase contract. Both phases
+/// are recorded at the same `extent`: the subject and operator offscreen
+/// targets are always kept the same size (see
+/// `Graphics::resize_offscreen_targets_if_needed`), so `canvas.base_layer_size()`
+/// matches whichever target each phase is actually drawn into either way.
 fn record_task_pictures(
   extent: vk::Extent2D,
   current_task: &SharedTask,

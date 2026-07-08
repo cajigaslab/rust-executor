@@ -1,8 +1,10 @@
-/// The fixed canvas size `BehaviorTask::render` draws into (via
-/// `canvas.base_layer_size()`, backed by `gfx::OFFSCREEN_EXTENT`) and that
-/// touch/gaze input is rescaled into from window/device-native coordinates,
-/// so tasks can treat input and rendering as the same coordinate space
-/// regardless of the subject window's actual current size (e.g. windowed vs.
-/// fullscreen on a differently-sized monitor).
+/// The subject window's initial size — both the size it's actually created
+/// at (see `gfx::Graphics::new`) and the placeholder
+/// `touch_screen::SharedWindowSize` holds before the first real size is
+/// polled. `BehaviorTask::render` no longer draws into a fixed canvas of
+/// this size — the offscreen targets (and so `canvas.base_layer_size()`,
+/// and the space touch/gaze input is reported in) track the subject
+/// window's actual current size instead (see
+/// `gfx::Graphics::resize_offscreen_targets_if_needed`).
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 720;

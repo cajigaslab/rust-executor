@@ -7,6 +7,7 @@ use crate::analog::last_span_value;
 use crate::behavior_task::SharedTask;
 use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
+use crate::touch_screen::SharedWindowSize;
 
 const OCULOMATIC_NODE_TYPE: &str = "OCULOMATIC";
 
@@ -186,16 +187,19 @@ fn angular_scaling_process(x: f64, y: f64, pins: &[Pin], scale_default: f64) -> 
 /// Streams eye-tracking input from Thalamus's `analog` RPC for the
 /// OCULOMATIC node over `client` (shared with `touch_screen::run`, since both
 /// just hit the same service's `analog` RPC for different node types),
-/// converts each raw reading to operator-canvas-local pixel coordinates via
+/// converts each raw reading to window-local pixel coordinates via
 /// `angular_scaling_process` (the same algorithm as Thalamus's own
-/// `AngularScalingConfig.process`), appends it to `gaze_path` for the
-/// operator view's gaze overlay, and forwards it to whichever `BehaviorTask`
-/// is currently running (if any), mirroring `touch_screen::run`.
+/// `AngularScalingConfig.process`, which reports gaze relative to screen
+/// center) plus `window_size` (to locate that center in the subject window's
+/// current — possibly since-resized — size), appends it to `gaze_path` for
+/// the operator view's gaze overlay, and forwards it to whichever
+/// `BehaviorTask` is currently running (if any), mirroring `touch_screen::run`.
 pub async fn run(
   mut client: ThalamusClient<Channel>,
   angular_scaling: SharedAngularScaling,
   gaze_path: SharedGazePath,
   current_task: SharedTask,
+  window_size: SharedWindowSize,
 ) -> anyhow::Result<()> {
   let request = AnalogRequest {
     node: Some(NodeSelector {
@@ -222,8 +226,9 @@ pub async fn run(
       angular_scaling_process(x, -y, &cache.pins, cache.scale_default)
     };
 
-    let local_x = (scaled_x + crate::canvas::WIDTH as f64 / 2.0).round() as i32;
-    let local_y = (scaled_y + crate::canvas::HEIGHT as f64 / 2.0).round() as i32;
+    let (window_width, window_height) = *window_size.lock().unwrap();
+    let local_x = (scaled_x + window_width as f64 / 2.0).round() as i32;
+    let local_y = (scaled_y + window_height as f64 / 2.0).round() as i32;
 
     if let Some(task) = current_task.lock().unwrap().as_ref() {
       task.on_gaze(local_x, local_y);

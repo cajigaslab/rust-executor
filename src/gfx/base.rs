@@ -45,9 +45,40 @@ impl VulkanBase {
       .engine_version(0)
       .api_version(vk::API_VERSION_1_1);
 
+    // Kept alive through `create_instance` below: `enabled_layers` (if the
+    // validation layer is enabled) holds a raw pointer into it.
+    let validation_layer_name = CString::new("VK_LAYER_KHRONOS_validation")?;
+    let mut enabled_layers: Vec<*const std::os::raw::c_char> = Vec::new();
+
+    // Enumerated/printed regardless of build type; only actually loaded as
+    // an enabled layer below in debug builds.
+    let available_layers = unsafe { entry.enumerate_instance_layer_properties()? };
+    println!("Available Vulkan instance layers:");
+    let mut found_validation_layer = false;
+    for layer in &available_layers {
+      if let Ok(name) = layer.layer_name_as_c_str() {
+        println!("  {}", name.to_string_lossy());
+        if name == validation_layer_name.as_c_str() {
+          found_validation_layer = true;
+        }
+      }
+    }
+
+    if cfg!(debug_assertions) {
+      if found_validation_layer {
+        enabled_layers.push(validation_layer_name.as_ptr());
+      } else {
+        tracing::warn!(
+          "Vulkan validation layer {:?} not found; running without it",
+          validation_layer_name
+        );
+      }
+    }
+
     let instance_create_info = vk::InstanceCreateInfo::default()
       .application_info(&app_info)
-      .enabled_extension_names(&required_extensions);
+      .enabled_extension_names(&required_extensions)
+      .enabled_layer_names(&enabled_layers);
 
     let instance = unsafe { entry.create_instance(&instance_create_info, None)? };
     let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);

@@ -60,6 +60,10 @@ pub async fn run(
     let body = body_of(&config);
     let task_type = task_type_of(&body);
     println!("task_type: {task_type}");
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&body).expect("config should always serialize to JSON")
+    );
 
     let result = match registry.get(&task_type) {
       Some(factory) => {

@@ -20,9 +20,9 @@ use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 use super::{BehaviorTask, TaskContext, Window};
 
-const SUCCESS_SOUND_PATH: &str = r"C:\thalamus-extensions\seokhee\success_clip.wav";
-const ABORT_SOUND_PATH: &str = r"C:\thalamus-extensions\seokhee\failure_clip.wav";
-const FAILURE_SOUND_PATH: &str = r"C:\thalamus-extensions\seokhee\timeout_failure.wav";
+const SUCCESS_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\success_clip.wav";
+const ABORT_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\failure_clip.wav";
+const FAILURE_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\timeout_failure.wav";
 
 /// Degrees/pixels/meters conversions for the subject monitor. Ported from the
 /// Python task's `Converter` class — only the pieces this port actually uses:
@@ -156,10 +156,19 @@ static STATE: OnceLock<VcpSetup> = OnceLock::new();
 /// Panics rather than defaulting: a missing/malformed field here means the
 /// task config doesn't match what this task requires to run at all, which is
 /// worth failing loudly on rather than silently proceeding with a bogus 0.
+/// Reads a JSON number as `i64`, accepting a float-encoded whole number
+/// (e.g. `20.0`) as well as a plain integer — some config values arrive
+/// float-encoded depending on how they were authored.
+fn value_as_i64(value: &Value) -> Option<i64> {
+  value
+    .as_i64()
+    .or_else(|| value.as_f64().map(|f| f.round() as i64))
+}
+
 fn get_i64(config: &Value, key: &str) -> i64 {
   config
     .get(key)
-    .and_then(Value::as_i64)
+    .and_then(value_as_i64)
     .unwrap_or_else(|| panic!("task config missing required integer field {key:?}: {config}"))
 }
 
@@ -174,7 +183,7 @@ fn get_nested_i64(config: &Value, key: &str, sub_key: &str) -> i64 {
   config
     .get(key)
     .and_then(|v| v.get(sub_key))
-    .and_then(Value::as_i64)
+    .and_then(value_as_i64)
     .unwrap_or_else(|| {
       panic!("task config missing required integer field {key:?}.{sub_key:?}: {config}")
     })
@@ -1482,6 +1491,12 @@ impl BehaviorTask for VcpInhibitionTask {
       255.0,
       luminance_targ_per as f32,
     );
+    println!(
+      "gaussian target: pos={targetpos_pix:?} width_pix={width_targ_pix:.1} height_pix={height_targ_pix:.1} luminance_pct={luminance_targ_per:.1} orientation_deg={orientation_targ_ran:.1} background_rgb=({}, {}, {})",
+      (background_color_qt.r * 255.0) as u8,
+      (background_color_qt.g * 255.0) as u8,
+      (background_color_qt.b * 255.0) as u8,
+    );
 
     let _ = (
       paint_all_targets,
@@ -2227,5 +2242,17 @@ impl BehaviorTask for VcpInhibitionTask {
   /// affect a condition a future one cares about.
   fn on_touch(&self, _x: i32, _y: i32) {
     self.condition_notify.notify_one();
+  }
+
+  /// A "Clear VCP" button that clears the persistent
+  /// `gaze_success_store`/`gaze_failure_store` traces (see `VcpSetup`) drawn
+  /// in the operator view.
+  fn operator_widget(&self, ui: &imgui::Ui) {
+    if ui.button("Clear VCP") {
+      if let Some(state) = STATE.get() {
+        state.gaze_success_store.lock().unwrap().clear();
+        state.gaze_failure_store.lock().unwrap().clear();
+      }
+    }
   }
 }

@@ -54,6 +54,13 @@ pub trait BehaviorTask: Send + Sync {
   /// OCULOMATIC analog stream (see `eye_tracking::run`). The default does
   /// nothing; tasks that care about gaze input override it.
   fn on_gaze(&self, _x: i32, _y: i32) {}
+
+  /// Draws this task's own control panel in the operator view, in the space
+  /// underneath the mirrored subject-view image (see
+  /// `gfx::Graphics::render_frame`, which calls this between the image and
+  /// its own Clear/Opacity/Show controls). The default draws nothing; tasks
+  /// that want operator-side controls override it.
+  fn operator_widget(&self, _ui: &imgui::Ui) {}
 }
 
 /// Creates a fresh [`BehaviorTask`] instance for one trial of a given

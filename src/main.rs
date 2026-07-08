@@ -181,7 +181,6 @@ async fn run_grpc(
       touch_client,
       touch_current_task,
       window_position,
-      window_size,
       touch_path,
     )
     .await
@@ -196,6 +195,7 @@ async fn run_grpc(
       gaze_angular_scaling,
       gaze_path,
       gaze_current_task,
+      window_size,
     )
     .await
     {

@@ -8,12 +8,12 @@ use crate::gfx::base::VulkanBase;
 /// frame N instead of fully serializing on a single command buffer.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Per-frame-in-flight resources: one command buffer and its own semaphores/
+/// Per-frame-in-flight resources: one command buffer and its own semaphore/
 /// fence, so up to `MAX_FRAMES_IN_FLIGHT` of these can be outstanding at once.
+/// `render_finished` isn't here — see `SwapchainWindow::render_finished`.
 struct FrameSync {
   command_buffer: vk::CommandBuffer,
   image_available: vk::Semaphore,
-  render_finished: vk::Semaphore,
   in_flight: vk::Fence,
 }
 
@@ -39,6 +39,16 @@ pub struct SwapchainWindow {
   /// indexed frame-in-flight slot is still using (images and frames-in-flight
   /// aren't the same count, so acquisition order isn't 1:1 with `frames`).
   images_in_flight: Vec<vk::Fence>,
+  /// One semaphore per swapchain image (not per frame-in-flight!), signaled
+  /// by `end_frame`'s submit and waited on by its present, indexed by
+  /// `image_index`. A binary semaphore must be unsignaled when a submit
+  /// signals it again, but with `MAX_FRAMES_IN_FLIGHT` != the swapchain's
+  /// image count (and more so under `PresentModeKHR::IMMEDIATE`, which
+  /// doesn't serialize presents the way FIFO does), a frame-in-flight-indexed
+  /// semaphore can still be pending presentation when a *different* image's
+  /// submit tries to reuse it — hence indexing by image instead, per
+  /// <https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html>.
+  render_finished: Vec<vk::Semaphore>,
 }
 
 /// The state needed to record and later submit/present one frame.
@@ -85,11 +95,6 @@ impl SwapchainWindow {
               .device
               .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
           },
-          render_finished: unsafe {
-            base
-              .device
-              .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
-          },
           in_flight: unsafe {
             base.device.create_fence(
               &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -115,6 +120,7 @@ impl SwapchainWindow {
       frames,
       current_frame: 0,
       images_in_flight: Vec::new(),
+      render_finished: Vec::new(),
     };
     target.recreate(base)?;
     Ok(target)
@@ -281,10 +287,23 @@ impl SwapchainWindow {
 
     self.images_in_flight = vec![vk::Fence::null(); self.images.len()];
 
+    // One per swapchain image — see `Self::render_finished`'s doc comment
+    // for why this can't just be per-frame-in-flight like `image_available`.
+    self.render_finished = (0..self.images.len())
+      .map(|_| unsafe {
+        base
+          .device
+          .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+      })
+      .collect::<Result<_, _>>()?;
+
     Ok(())
   }
 
   fn destroy_swapchain_dependents(&mut self, base: &VulkanBase) {
+    for semaphore in self.render_finished.drain(..) {
+      unsafe { base.device.destroy_semaphore(semaphore, None) };
+    }
     for framebuffer in self.framebuffers.drain(..) {
       unsafe { base.device.destroy_framebuffer(framebuffer, None) };
     }
@@ -361,12 +380,11 @@ impl SwapchainWindow {
   /// Ends, submits and presents the frame begun by [`Self::begin_frame`].
   pub fn end_frame(&mut self, base: &VulkanBase, image_index: u32) -> Result<()> {
     let frame = &self.frames[self.current_frame];
-    let (command_buffer, image_available, render_finished, in_flight) = (
-      frame.command_buffer,
-      frame.image_available,
-      frame.render_finished,
-      frame.in_flight,
-    );
+    let (command_buffer, image_available, in_flight) =
+      (frame.command_buffer, frame.image_available, frame.in_flight);
+    // Indexed by the swapchain image, not the frame-in-flight slot — see
+    // `Self::render_finished`'s doc comment.
+    let render_finished = self.render_finished[image_index as usize];
 
     unsafe { base.device.end_command_buffer(command_buffer)? };
 
@@ -419,7 +437,6 @@ impl SwapchainWindow {
         .destroy_swapchain(self.swapchain, None);
       for frame in &self.frames {
         base.device.destroy_semaphore(frame.image_available, None);
-        base.device.destroy_semaphore(frame.render_finished, None);
         base.device.destroy_fence(frame.in_flight, None);
       }
       base.device.destroy_command_pool(self.command_pool, None);
