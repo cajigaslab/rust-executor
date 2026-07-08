@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
@@ -51,6 +51,14 @@ const OFFSCREEN_EXTENT: vk::Extent2D = vk::Extent2D {
 /// visible benefit past what either window can present.
 const MAX_FPS: u32 = 1000;
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / MAX_FPS as u64);
+
+/// Rate limit for simulated gaze input (see `App::window_event`'s
+/// right-click-drag handling): `CursorMoved` events can fire far faster than
+/// any real eye tracker samples, so forwarding is throttled to this rate
+/// instead of once per event.
+const SIMULATED_GAZE_HZ: u32 = 120;
+const SIMULATED_GAZE_INTERVAL: Duration =
+  Duration::from_nanos(1_000_000_000 / SIMULATED_GAZE_HZ as u64);
 
 /// How often the operator view's touch and gaze paths are wiped (matches
 /// Thalamus's own `Canvas.__clear_periodically`).
@@ -119,6 +127,9 @@ pub fn run(
     trial_counter,
     result: Ok(()),
     modifiers: ModifiersState::empty(),
+    simulated_gaze_active: false,
+    last_cursor_pos: None,
+    last_simulated_gaze_at: None,
   };
   event_loop.run_app(&mut app)?;
   app.result
@@ -186,6 +197,24 @@ struct App {
   /// recognized in `KeyboardInput`, which doesn't carry modifier state
   /// itself.
   modifiers: ModifiersState,
+  /// Whether the right mouse button is currently held down on the subject
+  /// window. While true, `CursorMoved` events there are forwarded as
+  /// simulated gaze samples (see `window_event`), so gaze input can be
+  /// exercised — click and drag with the right mouse button — without real
+  /// eye-tracking hardware.
+  simulated_gaze_active: bool,
+  /// The subject window's last known cursor position (physical, window-local
+  /// pixels — the same space `CursorMoved` itself reports and `on_gaze`/
+  /// `gaze_path` expect), so a right-click-without-moving-first still has a
+  /// position to forward immediately on press.
+  last_cursor_pos: Option<(f64, f64)>,
+  /// When the last simulated gaze sample was forwarded, so `window_event`
+  /// can rate-limit `CursorMoved`-driven forwarding to
+  /// [`SIMULATED_GAZE_INTERVAL`] instead of forwarding one sample per
+  /// `CursorMoved` event, which can fire far faster than any real eye
+  /// tracker samples. Reset to `None` between drags (button released), so a
+  /// new drag's first sample always forwards immediately.
+  last_simulated_gaze_at: Option<Instant>,
 }
 
 impl App {
@@ -193,6 +222,19 @@ impl App {
     self.result = Err(err);
     event_loop.exit();
   }
+}
+
+/// Forwards `(x, y)` as a gaze sample exactly like a real OCULOMATIC reading
+/// would (see `eye_tracking::run`): to the current `BehaviorTask` (if any)
+/// and appended to `gaze_path` for the operator view's overlay. A free
+/// function (rather than an `App` method) so callers already holding a
+/// `&mut self.graphics` borrow — see `window_event` — can still call it,
+/// since it only needs `current_task`/`gaze_path`, not all of `self`.
+fn forward_simulated_gaze(current_task: &SharedTask, gaze_path: &SharedGazePath, x: i32, y: i32) {
+  if let Some(task) = current_task.lock().unwrap().as_ref() {
+    task.on_gaze(x, y);
+  }
+  gaze_path.lock().unwrap().push((x, y));
 }
 
 impl ApplicationHandler for App {
@@ -250,6 +292,23 @@ impl ApplicationHandler for App {
     }
 
     if window_id == graphics.subject.window.id() {
+      if let WindowEvent::CursorMoved { position, .. } = &event {
+        self.last_cursor_pos = Some((position.x, position.y));
+      }
+
+      if let WindowEvent::MouseInput {
+        state,
+        button: MouseButton::Right,
+        ..
+      } = &event
+      {
+        self.simulated_gaze_active = *state == ElementState::Pressed;
+        // Forces an immediate forward on the very next tick of
+        // `about_to_wait`'s continuous sampling below, rather than waiting
+        // out whatever's left of a stale interval from an earlier drag.
+        self.last_simulated_gaze_at = None;
+      }
+
       if let WindowEvent::KeyboardInput {
         event: key_event, ..
       } = &event
@@ -276,6 +335,30 @@ impl ApplicationHandler for App {
     let Some(graphics) = &mut self.graphics else {
       return;
     };
+
+    // Continuously resample the cursor position at SIMULATED_GAZE_HZ while
+    // the right mouse button is held, rather than only forwarding on
+    // `CursorMoved` — a real eye tracker keeps sampling even when gaze isn't
+    // moving. Independent of frame pacing below (120 Hz is well under even
+    // the 1000 Hz frame cap), so this runs before that early-returns.
+    if self.simulated_gaze_active {
+      let now = Instant::now();
+      let due = match self.last_simulated_gaze_at {
+        Some(at) => now.duration_since(at) >= SIMULATED_GAZE_INTERVAL,
+        None => true,
+      };
+      if due {
+        if let Some((x, y)) = self.last_cursor_pos {
+          self.last_simulated_gaze_at = Some(now);
+          forward_simulated_gaze(
+            &self.current_task,
+            &self.gaze_path,
+            x.round() as i32,
+            y.round() as i32,
+          );
+        }
+      }
+    }
 
     let next_frame_at = graphics.last_frame_at + MIN_FRAME_INTERVAL;
     if Instant::now() < next_frame_at {
