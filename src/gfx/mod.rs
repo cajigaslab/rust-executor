@@ -1,4 +1,5 @@
 mod base;
+mod dot_pipeline;
 mod offscreen;
 mod skia_offscreen;
 mod window_target;
@@ -11,7 +12,7 @@ use imgui_rs_vulkan_renderer::vulkan::{
 };
 use imgui_rs_vulkan_renderer::{Options, Renderer};
 use imgui_winit_support::WinitPlatform;
-use skia_safe::{Color4f, Paint, PaintStyle, PathBuilder, Picture, PictureRecorder, Rect};
+use skia_safe::{Color4f, Picture, PictureRecorder, Rect};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -26,6 +27,7 @@ use crate::eye_tracking::SharedGazePath;
 use crate::task_controller::SharedTrialCounter;
 use crate::touch_screen::{SharedTouchPath, SharedWindowPosition, SharedWindowSize};
 use base::VulkanBase;
+use dot_pipeline::{DotPipeline, DotTarget};
 use offscreen::OffscreenTarget;
 use skia_offscreen::SkiaOffscreen;
 use window_target::{MAX_FRAMES_IN_FLIGHT, SwapchainWindow};
@@ -132,6 +134,12 @@ struct Graphics {
   skia: SkiaOffscreen,
   operator_offscreen: OffscreenTarget,
   operator_skia: SkiaOffscreen,
+  /// Renders the touch/gaze trace dots directly (bypassing Skia — see
+  /// `dot_pipeline`'s doc comment for why) into `operator_offscreen` right
+  /// after its Skia flush. Operator-view only — the subject view never
+  /// shows the touch/gaze traces.
+  dot_pipeline: DotPipeline,
+  dot_target_operator: DotTarget,
   imgui: imgui::Context,
   platform: WinitPlatform,
   renderer: Renderer,
@@ -344,6 +352,9 @@ impl Graphics {
     // Safety: same as `skia` above, for `operator_offscreen`.
     let operator_skia = unsafe { SkiaOffscreen::new(&base, &operator_offscreen)? };
 
+    let dot_pipeline = DotPipeline::new(&base)?;
+    let dot_target_operator = dot_pipeline.create_target(&base, &operator_offscreen)?;
+
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
     let mut platform = WinitPlatform::new(&mut imgui);
@@ -406,6 +417,8 @@ impl Graphics {
       skia,
       operator_offscreen,
       operator_skia,
+      dot_pipeline,
+      dot_target_operator,
       imgui,
       platform,
       renderer,
@@ -424,15 +437,17 @@ impl Graphics {
     })
   }
 
-  /// (Re)creates both `self.offscreen`/`self.skia` and
-  /// `self.operator_offscreen`/`self.operator_skia` at the subject window's
-  /// current physical size whenever it's changed, so the two offscreen
-  /// targets always match the subject window (and, since both are always
-  /// resized together here, each other) instead of a fixed resolution — a
-  /// per-frame poll (like `App::about_to_wait`'s position/size tracking)
-  /// rather than reacting to `WindowEvent::Resized`, for the same reason:
-  /// resize events can race with the window manager still settling the
-  /// window rect. A no-op most frames, once the sizes already match.
+  /// (Re)creates `self.offscreen`/`self.skia`, `self.operator_offscreen`/
+  /// `self.operator_skia`, and `self.dot_target_operator` (whose framebuffer
+  /// wraps `operator_offscreen`'s view, so it goes stale the moment that's
+  /// recreated) at the subject window's current physical size whenever it's
+  /// changed, so the two offscreen targets always match the subject window
+  /// (and, since both are always resized together here, each other) instead
+  /// of a fixed resolution — a per-frame poll (like `App::about_to_wait`'s
+  /// position/size tracking) rather than reacting to `WindowEvent::Resized`,
+  /// for the same reason: resize events can race with the window manager
+  /// still settling the window rect. A no-op most frames, once the sizes
+  /// already match.
   fn resize_offscreen_targets_if_needed(&mut self) -> Result<()> {
     let physical_size = self.subject.window.inner_size();
     if physical_size.width == 0 || physical_size.height == 0 {
@@ -461,6 +476,9 @@ impl Graphics {
     let new_skia = unsafe { SkiaOffscreen::new(&self.base, &new_offscreen)? };
     let new_operator_offscreen = OffscreenTarget::new(&self.base, new_extent)?;
     let new_operator_skia = unsafe { SkiaOffscreen::new(&self.base, &new_operator_offscreen)? };
+    let new_dot_target_operator = self
+      .dot_pipeline
+      .create_target(&self.base, &new_operator_offscreen)?;
 
     // The imgui texture the operator UI displays points at the *old*
     // operator offscreen's view/sampler; repoint it at the new one in place
@@ -489,8 +507,15 @@ impl Graphics {
     let old_operator_offscreen =
       std::mem::replace(&mut self.operator_offscreen, new_operator_offscreen);
     let old_operator_skia = std::mem::replace(&mut self.operator_skia, new_operator_skia);
+    let old_dot_target_operator =
+      std::mem::replace(&mut self.dot_target_operator, new_dot_target_operator);
     drop(old_skia);
     drop(old_operator_skia);
+    // Must destroy before `old_operator_offscreen.destroy`: its framebuffer
+    // references `old_operator_offscreen.view`.
+    self
+      .dot_pipeline
+      .destroy_target(&self.base, old_dot_target_operator);
     old_offscreen.destroy(&self.base);
     old_operator_offscreen.destroy(&self.base);
 
@@ -544,14 +569,14 @@ impl Graphics {
       points.clone()
     };
 
-    let no_points: Vec<(i32, i32)> = Vec::new();
-    let touch_points_shown = if self.show_touch {
-      &touch_points
+    let no_points: [(i32, i32); 0] = [];
+    let touch_points_shown: &[(i32, i32)] = if self.show_touch {
+      touch_points.points()
     } else {
       &no_points
     };
-    let gaze_points_shown = if self.show_gaze {
-      &gaze_points
+    let gaze_points_shown: &[(i32, i32)] = if self.show_gaze {
+      gaze_points.points()
     } else {
       &no_points
     };
@@ -566,9 +591,6 @@ impl Graphics {
       &self.offscreen,
       &mut self.skia,
       subject_picture,
-      touch_points_shown,
-      gaze_points_shown,
-      trace_opacity,
     )?;
 
     // Acquired here (rather than right before the render pass below, as
@@ -576,11 +598,15 @@ impl Graphics {
     // offscreen's post-render layout transition ahead of the render pass
     // that samples it.
     let frame = self.operator.begin_frame(&self.base)?;
+    let operator_frame_index = self.operator.current_frame();
     render_operator_offscreen(
       &self.base,
       &self.operator_offscreen,
       &mut self.operator_skia,
       operator_picture,
+      &self.dot_pipeline,
+      &mut self.dot_target_operator,
+      operator_frame_index,
       touch_points_shown,
       gaze_points_shown,
       trace_opacity,
@@ -698,8 +724,14 @@ impl Graphics {
     drop(self.renderer);
     drop(self.skia);
     drop(self.operator_skia);
+    // Must drop before `operator_offscreen.destroy`: the dot target's
+    // framebuffer references `operator_offscreen.view`.
+    self
+      .dot_pipeline
+      .destroy_target(&self.base, self.dot_target_operator);
     self.offscreen.destroy(&self.base);
     self.operator_offscreen.destroy(&self.base);
+    self.dot_pipeline.destroy(&self.base);
     self.subject.destroy(&self.base);
     self.operator.destroy(&self.base);
     unsafe {
@@ -771,9 +803,6 @@ fn render_subject_frame(
   offscreen: &OffscreenTarget,
   skia: &mut SkiaOffscreen,
   picture: Option<Picture>,
-  touch_points: &[(i32, i32)],
-  gaze_points: &[(i32, i32)],
-  trace_opacity: f32,
 ) -> Result<()> {
   let clear_color = Color4f::new(
     BLANK_CLEAR_COLOR[0],
@@ -786,9 +815,6 @@ fn render_subject_frame(
     if let Some(picture) = picture.as_ref() {
       canvas.draw_picture(picture, None, None);
     }
-
-    draw_dot_path(canvas, touch_points, TOUCH_DOT_COLOR, trace_opacity);
-    draw_dot_path(canvas, gaze_points, GAZE_DOT_COLOR, trace_opacity);
   });
   let layout_after_skia = skia.current_layout();
 
@@ -905,45 +931,25 @@ fn render_subject_frame(
   subject.end_frame(base, frame.image_index)
 }
 
-/// Draws the given points (already batched into a single `Path`/`draw_path`
-/// call rather than one `draw_circle` call per point) as filled dots of the
-/// given color, with `opacity` (0.0-1.0) applied on top of the color's own
-/// alpha. A no-op if `points` is empty.
-fn draw_dot_path(canvas: &skia_safe::Canvas, points: &[(i32, i32)], color: [f32; 4], opacity: f32) {
-  if points.is_empty() {
-    return;
-  }
-
-  let mut builder = PathBuilder::new();
-  for &(x, y) in points {
-    builder.add_circle((x as f32, y as f32), DOT_RADIUS, None);
-  }
-  let path = builder.detach();
-
-  let mut dot_paint = Paint::new(
-    Color4f::new(color[0], color[1], color[2], color[3] * opacity),
-    None,
-  );
-  dot_paint.set_anti_alias(true);
-  dot_paint.set_style(PaintStyle::Fill);
-  canvas.draw_path(&path, &dot_paint);
-}
-
 /// Draws the given (already-recorded operator-phase) picture into the
-/// operator offscreen target via Skia, overlaid with the touch path (see
-/// `Graphics::render_frame`) as a path of red dots and the gaze path as a
-/// path of blue dots — same overlay as the subject view (see
-/// `render_subject_frame`). Transitions the result for sampling by the
-/// operator window's imgui UI, which displays it in an `imgui::Image`.
-/// Unlike the subject view, there's no swapchain blit here: `command_buffer`
-/// must be one already begun (via `SwapchainWindow::begin_frame`) but not yet
-/// in a render pass, since this records a pipeline barrier that a render
-/// pass can't contain.
+/// operator offscreen target via Skia, then the touch path (red dots) and
+/// gaze path (blue dots) via `dot_pipeline` directly (bypassing Skia — see
+/// `dot_pipeline`'s doc comment for why), overlaid on top of it. Transitions
+/// the result for sampling by the operator window's imgui UI, which
+/// displays it in an `imgui::Image`. Unlike the subject view, there's no
+/// swapchain blit here: `command_buffer` must be one already begun (via
+/// `SwapchainWindow::begin_frame`) but not yet in a render pass, since both
+/// the pipeline barriers and the dot render pass this records need to not be
+/// nested inside another render pass.
+#[allow(clippy::too_many_arguments)]
 fn render_operator_offscreen(
   base: &VulkanBase,
   offscreen: &OffscreenTarget,
   skia: &mut SkiaOffscreen,
   picture: Option<Picture>,
+  dot_pipeline: &DotPipeline,
+  dot_target: &mut DotTarget,
+  frame_index: usize,
   touch_points: &[(i32, i32)],
   gaze_points: &[(i32, i32)],
   trace_opacity: f32,
@@ -960,22 +966,64 @@ fn render_operator_offscreen(
     if let Some(picture) = picture.as_ref() {
       canvas.draw_picture(picture, None, None);
     }
-
-    draw_dot_path(canvas, touch_points, TOUCH_DOT_COLOR, trace_opacity);
-    draw_dot_path(canvas, gaze_points, GAZE_DOT_COLOR, trace_opacity);
   });
   let layout_after_skia = skia.current_layout();
 
-  // See the equivalent barrier in `render_subject_frame` for why the src
-  // stage/access is deliberately wide.
+  // Pre-dot-pass: land the image in COLOR_ATTACHMENT_OPTIMAL — the dot
+  // render pass's expected initial layout (`LOAD_OP_LOAD` preserving Skia's
+  // just-drawn content) — from whatever Skia left it in. See the equivalent
+  // barrier in `render_subject_frame` for why the src stage/access is
+  // deliberately wide.
   offscreen.transition(
     base,
     command_buffer,
     layout_after_skia,
-    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     (
       vk::PipelineStageFlags::ALL_COMMANDS,
       vk::AccessFlags::MEMORY_WRITE,
+    ),
+    (
+      vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+      vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+    ),
+  );
+
+  let touch_color = [
+    TOUCH_DOT_COLOR[0],
+    TOUCH_DOT_COLOR[1],
+    TOUCH_DOT_COLOR[2],
+    TOUCH_DOT_COLOR[3] * trace_opacity,
+  ];
+  let gaze_color = [
+    GAZE_DOT_COLOR[0],
+    GAZE_DOT_COLOR[1],
+    GAZE_DOT_COLOR[2],
+    GAZE_DOT_COLOR[3] * trace_opacity,
+  ];
+  dot_pipeline.draw(
+    base,
+    dot_target,
+    frame_index,
+    command_buffer,
+    offscreen.extent,
+    touch_points,
+    touch_color,
+    gaze_points,
+    gaze_color,
+  );
+
+  // The dot render pass's `finalLayout` leaves the image in
+  // COLOR_ATTACHMENT_OPTIMAL; transition it the rest of the way for imgui to
+  // sample it.
+  offscreen.transition(
+    base,
+    command_buffer,
+    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    (
+      vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+      vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
     ),
     (
       vk::PipelineStageFlags::FRAGMENT_SHADER,

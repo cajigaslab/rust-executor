@@ -318,6 +318,16 @@ impl SwapchainWindow {
     self.images[index as usize]
   }
 
+  /// The frame-in-flight slot the most recent [`Self::begin_frame`] call is
+  /// using — i.e. the same index `frames`/`FrameSync` is indexed by. Lets
+  /// callers keep their own per-frame-in-flight resources (see
+  /// `gfx::dot_pipeline::DotTarget`) in step with this window's own, so
+  /// reusing one is backed by the same fence-wait guarantee `begin_frame`
+  /// already establishes for `frames[current_frame]`.
+  pub fn current_frame(&self) -> usize {
+    self.current_frame
+  }
+
   /// Waits for this frame-in-flight slot's previous command buffer to be
   /// free, acquires the next swapchain image (recreating the swapchain and
   /// retrying once if it's out of date), and begins recording.

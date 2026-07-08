@@ -33,14 +33,58 @@ pub fn shared_window_size() -> SharedWindowSize {
   Arc::new(Mutex::new((crate::canvas::WIDTH, crate::canvas::HEIGHT)))
 }
 
+/// Cap on how many points a [`PointRingBuffer`] (touch or gaze trace) holds
+/// at once. Also the size `gfx::dot_pipeline`'s per-trace GPU vertex buffers
+/// are allocated at, since the two must agree.
+pub const TRACE_CAPACITY: usize = 3600;
+
+/// A fixed-capacity ring buffer of points for the touch/gaze traces:
+/// `push` past `TRACE_CAPACITY` overwrites the oldest slot rather than
+/// growing forever, so both memory use and the per-frame rendering cost of
+/// drawing the trace stay bounded regardless of how long a trial (or a
+/// forgotten "Clear") runs. Order doesn't matter for rendering — each point
+/// is an independent dot — so [`Self::points`] just returns however many
+/// slots are currently valid, in storage order rather than oldest/newest.
+#[derive(Clone)]
+pub struct PointRingBuffer {
+  points: [(i32, i32); TRACE_CAPACITY],
+  next: usize,
+  len: usize,
+}
+
+impl PointRingBuffer {
+  pub fn new() -> Self {
+    Self {
+      points: [(0, 0); TRACE_CAPACITY],
+      next: 0,
+      len: 0,
+    }
+  }
+
+  pub fn push(&mut self, point: (i32, i32)) {
+    self.points[self.next] = point;
+    self.next = (self.next + 1) % TRACE_CAPACITY;
+    self.len = (self.len + 1).min(TRACE_CAPACITY);
+  }
+
+  pub fn clear(&mut self) {
+    self.next = 0;
+    self.len = 0;
+  }
+
+  pub fn points(&self) -> &[(i32, i32)] {
+    &self.points[..self.len]
+  }
+}
+
 /// Touch points received since the last periodic clear (see
 /// `gfx::Graphics::render_frame`, which clears it once a second), in
 /// subject-window-local coordinates. Rendered as a path of dots in the
 /// operator view only.
-pub type SharedTouchPath = Arc<Mutex<Vec<(i32, i32)>>>;
+pub type SharedTouchPath = Arc<Mutex<PointRingBuffer>>;
 
 pub fn shared_touch_path() -> SharedTouchPath {
-  Arc::new(Mutex::new(Vec::new()))
+  Arc::new(Mutex::new(PointRingBuffer::new()))
 }
 
 /// Streams touch input from Thalamus's `analog` RPC for the TOUCH_SCREEN node

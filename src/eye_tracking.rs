@@ -7,18 +7,19 @@ use crate::analog::last_span_value;
 use crate::behavior_task::SharedTask;
 use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
-use crate::touch_screen::SharedWindowSize;
+use crate::touch_screen::{PointRingBuffer, SharedWindowSize};
 
 const OCULOMATIC_NODE_TYPE: &str = "OCULOMATIC";
 
 /// Gaze points received since the last periodic clear (see
 /// `gfx::Graphics::render_frame`, which clears it alongside the touch path),
 /// in operator-canvas-local coordinates. Rendered as a path of dots in the
-/// operator view only.
-pub type SharedGazePath = Arc<Mutex<Vec<(i32, i32)>>>;
+/// operator view only. Bounded the same way as the touch path — see
+/// [`PointRingBuffer`].
+pub type SharedGazePath = Arc<Mutex<PointRingBuffer>>;
 
 pub fn shared_gaze_path() -> SharedGazePath {
-  Arc::new(Mutex::new(Vec::new()))
+  Arc::new(Mutex::new(PointRingBuffer::new()))
 }
 
 /// One calibration pin from the "Angular Scaling" eye-tracking model: an eye
