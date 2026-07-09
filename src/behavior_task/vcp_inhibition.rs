@@ -19,9 +19,9 @@ use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 use super::{BehaviorTask, PointSubscription, TaskContext, Window};
 
-const SUCCESS_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\success_clip.wav";
-const ABORT_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\failure_clip.wav";
-const FAILURE_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\timeout_failure.wav";
+const SUCCESS_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\success_clip.wav";
+const ABORT_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\failure_clip.wav";
+const FAILURE_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav";
 
 /// Degrees/pixels/meters conversions for the subject monitor. Ported from the
 /// Python task's `Converter` class — only the pieces this port actually uses:
@@ -660,6 +660,7 @@ pub struct VcpInhibitionTask {
   /// `TaskContext::gaze` for the operator view's gaze marker/readout. `None`
   /// until `run` is first called.
   context: Mutex<Option<Arc<TaskContext>>>,
+  trial_luminance_targ_per: Mutex<f64>,
 }
 
 impl VcpInhibitionTask {
@@ -669,6 +670,7 @@ impl VcpInhibitionTask {
       state: Mutex::new(None),
       show_target: Mutex::new(true),
       context: Mutex::new(None),
+      trial_luminance_targ_per: Mutex::new(0.0),
     }
   }
 
@@ -993,7 +995,8 @@ impl VcpInhibitionTask {
     context.log("BehavState=DELAY").await;
     println!("{:?}", State::Delay);
 
-    let success = self
+    let now = Instant::now();
+    let mut success = self
       .wait_for_hold(
         context,
         gaze_condition(gaze_queue, last_gaze, |point| {
@@ -1005,6 +1008,9 @@ impl VcpInhibitionTask {
         false,
       )
       .await;
+    if now.elapsed() >= del_duration {
+      success = true;
+    }
 
     let gaze = *last_gaze.lock().unwrap();
     let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1495,6 +1501,7 @@ impl BehaviorTask for VcpInhibitionTask {
       get_nested_f64(config, "luminance_targ_per", "max"),
       get_f64(config, "luminance_targ_step"),
     );
+    *self.trial_luminance_targ_per.lock().unwrap() = luminance_targ_per;
     context
       .log(&format!(
         "trial_summary_data.used_values luminance_targ_per={luminance_targ_per}"
@@ -1548,7 +1555,7 @@ impl BehaviorTask for VcpInhibitionTask {
       width_targ_pix as f32 / 2.0,
       3.0,
       255.0,
-      luminance_targ_per as f32,
+      100.0,
     );
     println!(
       "gaussian target: pos={targetpos_pix:?} width_pix={width_targ_pix:.1} height_pix={height_targ_pix:.1} luminance_pct={luminance_targ_per:.1} orientation_deg={orientation_targ_ran:.1} background_rgb=({}, {}, {})",
@@ -2113,6 +2120,7 @@ impl BehaviorTask for VcpInhibitionTask {
       Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0),
       &Paint::new(background_color_qt, None),
     );
+    let off_luminance = *self.trial_luminance_targ_per.lock().unwrap() as f32/100.0;
 
     // Line 1049 default; overridden to white in the GO_CUE/PRESENT_TARGET
     // branches below (lines 1115, 1127).
@@ -2135,7 +2143,7 @@ impl BehaviorTask for VcpInhibitionTask {
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
         if trial_type == TrialType::Saccade {
-          self.draw_gaussian(canvas, 0.0);
+          self.draw_gaussian(canvas, off_luminance);
         }
       }
       State::GoCue => {
@@ -2148,7 +2156,7 @@ impl BehaviorTask for VcpInhibitionTask {
           canvas.draw_path(&cross, &pen);
         }
         if trial_type == TrialType::Saccade {
-          self.draw_gaussian(canvas, 0.0);
+          self.draw_gaussian(canvas, off_luminance);
         }
       }
       State::PresentTarget => {
@@ -2173,7 +2181,7 @@ impl BehaviorTask for VcpInhibitionTask {
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         } else {
-          self.draw_gaussian(canvas, 0.0);
+          self.draw_gaussian(canvas, off_luminance);
         }
       }
       State::FailureSaccade => {
@@ -2194,8 +2202,8 @@ impl BehaviorTask for VcpInhibitionTask {
       Rect::from_xywh(
         canvas_size.width as f32 - 50.0,
         canvas_size.height as f32 - 50.0,
-        50.0,
-        50.0,
+        500.0,
+        500.0,
       ),
       &Paint::new(current_photodiode_static_square, None),
     );
@@ -2281,7 +2289,7 @@ impl BehaviorTask for VcpInhibitionTask {
       );
       draw_text(
         canvas,
-        &format!("({}, {})", valid_gaze.0, valid_gaze.1),
+        &format!("{current_state:?}"),
         valid_gaze.0 as f32,
         valid_gaze.1 as f32,
         background_color_qt,
