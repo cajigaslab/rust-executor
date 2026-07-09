@@ -11,7 +11,7 @@ use skia_safe::Canvas;
 use crate::pb::task_controller_grpc::TaskResult;
 
 pub use simple_arc::SimpleArcTask;
-pub use task_context::TaskContext;
+pub use task_context::{PointSubscription, TaskContext};
 pub use vcp_inhibition::VcpInhibitionTask;
 
 /// Which physical window a `render` call is currently producing pixels for.
@@ -35,25 +35,21 @@ pub enum Window {
 /// drawing each resulting image on its corresponding window. `render`
 /// implementations can branch on `window` to vary what they draw between the
 /// two phases (e.g. operator-only overlays), and use
-/// `canvas.base_layer_size()` for the canvas's pixel dimensions. `on_touch`
-/// is called (also concurrently with `run`) whenever a touch point is
-/// received from the TOUCH_SCREEN analog stream while this task is current
-/// (see `touch_screen::run`). Implementations use interior mutability (all
-/// methods take `&self`) since these can run on different threads at the
-/// same time.
+/// `canvas.base_layer_size()` for the canvas's pixel dimensions. Touch and
+/// gaze input aren't pushed to task-side handlers — implementations that
+/// care about them read `context.touch()`/`context.gaze()` (the latest
+/// sample) or subscribe to every sample via
+/// `context.subscribe_to_touch()`/`context.subscribe_to_gaze()` (see
+/// `TaskContext`). `render` itself isn't passed the `TaskContext` `run` got
+/// — implementations that need it there (e.g. to show current gaze in the
+/// operator view) should stash the `Arc<TaskContext>` `run` receives in a
+/// field of their own and read it back from `render`. Implementations use
+/// interior mutability (all methods take `&self`) since these can run on
+/// different threads at the same time.
 #[async_trait]
 pub trait BehaviorTask: Send + Sync {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult;
   fn render(&self, canvas: &Canvas, window: Window);
-
-  /// Called with the screen coordinates of a touch point. The default does
-  /// nothing; tasks that care about touch input override it.
-  fn on_touch(&self, _x: i32, _y: i32) {}
-
-  /// Called with the screen coordinates of a gaze sample from the
-  /// OCULOMATIC analog stream (see `eye_tracking::run`). The default does
-  /// nothing; tasks that care about gaze input override it.
-  fn on_gaze(&self, _x: i32, _y: i32) {}
 
   /// Draws this task's own control panel in the operator view, in the space
   /// underneath the mirrored subject-view image (see

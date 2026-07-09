@@ -1,23 +1,72 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 
 use kira::AudioManager;
 use kira::sound::static_sound::StaticSoundData;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
 use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{AnalogResponse, InjectAnalogRequest, Text, inject_analog_request};
 
+/// Cap on how many points a single [`PointSubscription`] buffers before
+/// being drained: once full, the oldest point is dropped to make room for
+/// the newest, so a subscription that's never drained (or drained too
+/// slowly) doesn't grow unbounded.
+const MAX_QUEUED_POINTS: usize = 3600;
+
+/// A live feed of touch or gaze points, created by
+/// [`TaskContext::subscribe_to_touch`]/[`TaskContext::subscribe_to_gaze`]:
+/// every point pushed to the `TaskContext` after subscribing is buffered
+/// here until [`Self::drain`] collects it. Stops receiving points (and lets
+/// `TaskContext` reclaim its buffer) as soon as it's dropped — `TaskContext`
+/// only holds a `Weak` reference to it.
+pub struct PointSubscription {
+  points: Arc<Mutex<VecDeque<(i32, i32)>>>,
+}
+
+impl PointSubscription {
+  /// Drains and returns every point received since the last call to this
+  /// method (or since subscribing, for the first call), oldest first.
+  pub fn drain(&self) -> Vec<(i32, i32)> {
+    self.points.lock().unwrap().drain(..).collect()
+  }
+}
+
+/// Registers `point` with every still-alive subscription in `subscribers`,
+/// dropping any whose `PointSubscription` has since gone away.
+fn publish(subscribers: &Mutex<Vec<Weak<Mutex<VecDeque<(i32, i32)>>>>>, point: (i32, i32)) {
+  subscribers.lock().unwrap().retain(|subscriber| {
+    let Some(points) = subscriber.upgrade() else {
+      return false;
+    };
+    let mut points = points.lock().unwrap();
+    if points.len() >= MAX_QUEUED_POINTS {
+      points.pop_front();
+    }
+    points.push_back(point);
+    true
+  });
+}
+
+fn subscribe(subscribers: &Mutex<Vec<Weak<Mutex<VecDeque<(i32, i32)>>>>>) -> PointSubscription {
+  let points = Arc::new(Mutex::new(VecDeque::new()));
+  subscribers.lock().unwrap().push(Arc::downgrade(&points));
+  PointSubscription { points }
+}
+
 /// Everything a [`super::BehaviorTask`] needs across trials: the current
 /// trial's `TaskConfig.body` (parsed as JSON), a Thalamus client it can use
-/// to log back to the server, and a sound manager it can use to play audio.
-/// Mirrors Python's `TaskContext`, which is constructed once for the whole
-/// task controller session — this `TaskContext` is likewise created once
-/// (see `task_controller::run`) and reused for every trial via
-/// [`TaskContext::begin_trial`], rather than recreated per trial.
+/// to log back to the server, a sound manager it can use to play audio, and
+/// the latest/subscribable touch and gaze samples (see
+/// `push_touch`/`push_gaze`, called by `touch_screen::run`/`eye_tracking::run`
+/// as samples arrive). Mirrors Python's `TaskContext`, which is constructed
+/// once for the whole task controller session — this `TaskContext` is
+/// likewise created once (see `main::run_grpc`) and shared for the lifetime
+/// of the process, reused for every trial via [`TaskContext::begin_trial`]
+/// rather than recreated per trial.
 pub struct TaskContext {
   config: Mutex<Value>,
   thalamus_client: ThalamusClient<Channel>,
@@ -35,6 +84,22 @@ pub struct TaskContext {
   /// expensive, and there's only ever one output), unlike sound *data*
   /// (`StaticSoundData`), which each `BehaviorTask` loads and owns itself.
   audio_manager: Mutex<AudioManager>,
+  /// The latest touch point received this session, `None` until the first
+  /// sample arrives. Updated by `push_touch`.
+  latest_touch: Mutex<Option<(i32, i32)>>,
+  /// The latest gaze point received this session, same update path as
+  /// `latest_touch`.
+  latest_gaze: Mutex<Option<(i32, i32)>>,
+  /// Every live [`PointSubscription`] returned by `subscribe_to_touch`,
+  /// weakly held — see `publish`/`subscribe`.
+  touch_subscribers: Mutex<Vec<Weak<Mutex<VecDeque<(i32, i32)>>>>>,
+  /// Every live [`PointSubscription`] returned by `subscribe_to_gaze`.
+  gaze_subscribers: Mutex<Vec<Weak<Mutex<VecDeque<(i32, i32)>>>>>,
+  /// Notified by every `push_touch`/`push_gaze` call — see [`Self::notify`].
+  /// Shared by both rather than split into a touch/gaze pair, since a
+  /// waiter that cares about one can just re-check its own condition and go
+  /// back to waiting on a spurious wakeup from the other.
+  notify: Notify,
 }
 
 impl TaskContext {
@@ -45,7 +110,81 @@ impl TaskContext {
       log_sender: Mutex::new(None),
       inject_analog_streams: Mutex::new(HashMap::new()),
       audio_manager: Mutex::new(audio_manager),
+      latest_touch: Mutex::new(None),
+      latest_gaze: Mutex::new(None),
+      touch_subscribers: Mutex::new(Vec::new()),
+      gaze_subscribers: Mutex::new(Vec::new()),
+      notify: Notify::new(),
     }
+  }
+
+  /// Records `point` as the latest touch sample (called by `touch_screen::run`
+  /// for every point received from the TOUCH_SCREEN analog stream), publishes
+  /// it to every live [`PointSubscription`] from `subscribe_to_touch`, and
+  /// wakes anyone waiting on [`Self::notify`].
+  pub fn push_touch(&self, point: (i32, i32)) {
+    *self.latest_touch.lock().unwrap() = Some(point);
+    publish(&self.touch_subscribers, point);
+    self.notify.notify_waiters();
+  }
+
+  /// Records `point` as the latest gaze sample (called by `eye_tracking::run`
+  /// for every point received from the OCULOMATIC analog stream, and by
+  /// `gfx`'s mouse-simulated gaze), publishes it to every live
+  /// [`PointSubscription`] from `subscribe_to_gaze`, and wakes anyone waiting
+  /// on [`Self::notify`].
+  pub fn push_gaze(&self, point: (i32, i32)) {
+    *self.latest_gaze.lock().unwrap() = Some(point);
+    publish(&self.gaze_subscribers, point);
+    self.notify.notify_waiters();
+  }
+
+  /// The most recent touch point, or `None` if none has arrived yet this
+  /// session.
+  pub fn touch(&self) -> Option<(i32, i32)> {
+    *self.latest_touch.lock().unwrap()
+  }
+
+  /// The most recent gaze point, or `None` if none has arrived yet this
+  /// session.
+  pub fn gaze(&self) -> Option<(i32, i32)> {
+    *self.latest_gaze.lock().unwrap()
+  }
+
+  /// Notified once for every `push_touch`/`push_gaze` call, via
+  /// `Notify::notify_waiters` — so, per its semantics, only wakes a waiter
+  /// that had already called `notified()` (even if not yet polled) *before*
+  /// the triggering push. The safe way to use this to wait for a touch/gaze
+  /// condition without missing a point that arrives in between is to
+  /// construct the `Notified` future *before* checking the condition, then
+  /// only await it if the condition is still unmet:
+  ///
+  /// ```ignore
+  /// loop {
+  ///   let notified = context.notify().notified();
+  ///   if condition() { break; }
+  ///   notified.await;
+  /// }
+  /// ```
+  ///
+  /// (see `vcp_inhibition::VcpInhibitionTask::wait_for`, which combines this
+  /// with a deadline via `tokio::select!`).
+  pub fn notify(&self) -> &Notify {
+    &self.notify
+  }
+
+  /// Starts a new live feed of every touch point received from now on —
+  /// see [`PointSubscription`]. Lets a task see every sample rather than
+  /// just [`Self::touch`]'s latest one.
+  pub fn subscribe_to_touch(&self) -> PointSubscription {
+    subscribe(&self.touch_subscribers)
+  }
+
+  /// Starts a new live feed of every gaze point received from now on — see
+  /// [`PointSubscription`]. Lets a task see every sample rather than just
+  /// [`Self::gaze`]'s latest one.
+  pub fn subscribe_to_gaze(&self) -> PointSubscription {
+    subscribe(&self.gaze_subscribers)
   }
 
   /// Plays `sound` through the shared audio manager.

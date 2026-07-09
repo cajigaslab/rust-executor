@@ -22,7 +22,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
-use crate::behavior_task::{SharedTask, Window};
+use crate::behavior_task::{SharedTask, TaskContext, Window};
 use crate::eye_tracking::SharedGazePath;
 use crate::task_controller::SharedTrialCounter;
 use crate::touch_screen::{SharedTouchPath, SharedWindowPosition, SharedWindowSize};
@@ -106,6 +106,7 @@ impl FpsCounter {
 /// platforms) until then.
 pub fn run(
   current_task: SharedTask,
+  context: Arc<TaskContext>,
   tokio_handle: tokio::runtime::Handle,
   window_position: SharedWindowPosition,
   window_size: SharedWindowSize,
@@ -119,6 +120,7 @@ pub fn run(
   let mut app = App {
     graphics: None,
     current_task,
+    context,
     tokio_handle,
     window_position,
     window_size,
@@ -186,6 +188,7 @@ struct Graphics {
 struct App {
   graphics: Option<Graphics>,
   current_task: SharedTask,
+  context: Arc<TaskContext>,
   tokio_handle: tokio::runtime::Handle,
   window_position: SharedWindowPosition,
   window_size: SharedWindowSize,
@@ -204,9 +207,10 @@ struct App {
   /// eye-tracking hardware.
   simulated_gaze_active: bool,
   /// The subject window's last known cursor position (physical, window-local
-  /// pixels — the same space `CursorMoved` itself reports and `on_gaze`/
-  /// `gaze_path` expect), so a right-click-without-moving-first still has a
-  /// position to forward immediately on press.
+  /// pixels — the same space `CursorMoved` itself reports and
+  /// `TaskContext::push_gaze`/`gaze_path` expect), so a
+  /// right-click-without-moving-first still has a position to forward
+  /// immediately on press.
   last_cursor_pos: Option<(f64, f64)>,
   /// When the last simulated gaze sample was forwarded, so `window_event`
   /// can rate-limit `CursorMoved`-driven forwarding to
@@ -225,15 +229,14 @@ impl App {
 }
 
 /// Forwards `(x, y)` as a gaze sample exactly like a real OCULOMATIC reading
-/// would (see `eye_tracking::run`): to the current `BehaviorTask` (if any)
-/// and appended to `gaze_path` for the operator view's overlay. A free
-/// function (rather than an `App` method) so callers already holding a
-/// `&mut self.graphics` borrow — see `window_event` — can still call it,
-/// since it only needs `current_task`/`gaze_path`, not all of `self`.
-fn forward_simulated_gaze(current_task: &SharedTask, gaze_path: &SharedGazePath, x: i32, y: i32) {
-  if let Some(task) = current_task.lock().unwrap().as_ref() {
-    task.on_gaze(x, y);
-  }
+/// would (see `eye_tracking::run`): pushed to `context` (see
+/// `TaskContext::push_gaze`) and appended to `gaze_path` for the operator
+/// view's overlay. A free function (rather than an `App` method) so callers
+/// already holding a `&mut self.graphics` borrow — see `window_event` — can
+/// still call it, since it only needs `context`/`gaze_path`, not all of
+/// `self`.
+fn forward_simulated_gaze(context: &TaskContext, gaze_path: &SharedGazePath, x: i32, y: i32) {
+  context.push_gaze((x, y));
   gaze_path.lock().unwrap().push((x, y));
 }
 
@@ -351,7 +354,7 @@ impl ApplicationHandler for App {
         if let Some((x, y)) = self.last_cursor_pos {
           self.last_simulated_gaze_at = Some(now);
           forward_simulated_gaze(
-            &self.current_task,
+            &self.context,
             &self.gaze_path,
             x.round() as i32,
             y.round() as i32,

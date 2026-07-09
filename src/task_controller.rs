@@ -1,13 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
-use tonic::transport::Channel;
-
 use crate::behavior_task::{self, SharedTask, TaskContext};
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::pb::task_controller_grpc::{TaskConfig, TaskResult};
-use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,12 +25,14 @@ pub fn shared_trial_counter() -> SharedTrialCounter {
 /// progress for as long as it runs, then dropping it once done), bump
 /// `trial_counter`, and report the `TaskResult` it returned back on the same
 /// stream (or a failing one, if no `BehaviorTask` is registered for the
-/// type).
+/// type). `context` is the session-wide `TaskContext` constructed once in
+/// `main::run_grpc` and shared with `touch_screen::run`/`eye_tracking::run`,
+/// not created here.
 pub async fn run(
   addr: String,
   current_task: SharedTask,
   trial_counter: SharedTrialCounter,
-  thalamus_client: ThalamusClient<Channel>,
+  context: Arc<TaskContext>,
 ) -> anyhow::Result<()> {
   let registry = behavior_task::registry();
 
@@ -46,15 +44,6 @@ pub async fn run(
   tracing::info!("connecting to TaskController execution stream at {addr}");
   let response = client.execution(outbound).await?;
   let mut inbound = response.into_inner();
-
-  // A real Thalamus `TaskContext` is constructed once for the whole task
-  // controller session and reused for every trial, so this is too — see
-  // `TaskContext::begin_trial`. The sound manager is likewise opened once
-  // here and forwarded to it, rather than each `BehaviorTask` opening its
-  // own.
-  let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
-    .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(thalamus_client, audio_manager));
 
   while let Some(config) = inbound.message().await? {
     let body = body_of(&config);

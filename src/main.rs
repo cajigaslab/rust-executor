@@ -9,7 +9,10 @@ mod state;
 mod task_controller;
 mod touch_screen;
 
-use behavior_task::SharedTask;
+use std::sync::Arc;
+
+use behavior_task::{SharedTask, TaskContext};
+use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
 use pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use pb::thalamus_grpc::{ObservableChange, ObservableTransaction};
 use serde_json::Value;
@@ -49,6 +52,12 @@ fn main() -> anyhow::Result<()> {
   let grpc_angular_scaling = angular_scaling.clone();
   let grpc_trial_counter = trial_counter.clone();
   let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+  // Sent by `run_grpc` once the session-wide `TaskContext` it builds (see
+  // its doc comment) is ready — shortly after the gRPC thread's Tokio
+  // runtime starts, not immediately, since building it needs an async
+  // connect — so `gfx::run` below can be handed the same instance
+  // `task_controller::run`/`touch_screen::run`/`eye_tracking::run` use.
+  let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
   std::thread::Builder::new()
     .name("grpc".to_string())
     .spawn(move || {
@@ -63,6 +72,7 @@ fn main() -> anyhow::Result<()> {
       if let Err(e) = runtime.block_on(run_grpc(
         addr,
         grpc_current_task,
+        context_tx,
         grpc_window_position,
         grpc_window_size,
         grpc_touch_path,
@@ -77,9 +87,13 @@ fn main() -> anyhow::Result<()> {
   let tokio_handle = handle_rx
     .recv()
     .map_err(|_| anyhow::anyhow!("grpc thread exited before it started its Tokio runtime"))?;
+  let context = context_rx
+    .recv()
+    .map_err(|_| anyhow::anyhow!("grpc thread exited before it built a TaskContext"))?;
 
   gfx::run(
     current_task,
+    context,
     tokio_handle,
     window_position,
     window_size,
@@ -92,6 +106,7 @@ fn main() -> anyhow::Result<()> {
 async fn run_grpc(
   mut addr: String,
   current_task: SharedTask,
+  context_tx: std::sync::mpsc::SyncSender<Arc<TaskContext>>,
   window_position: touch_screen::SharedWindowPosition,
   window_size: touch_screen::SharedWindowSize,
   touch_path: touch_screen::SharedTouchPath,
@@ -99,9 +114,26 @@ async fn run_grpc(
   angular_scaling: eye_tracking::SharedAngularScaling,
   trial_counter: task_controller::SharedTrialCounter,
 ) -> anyhow::Result<()> {
-  // The TOUCH_SCREEN/OCULOMATIC analog streams connect to this original
-  // address, not wherever observable_bridge_v2 ends up redirecting to below.
+  // The TOUCH_SCREEN/OCULOMATIC analog streams (and TaskContext's own
+  // logging/inject_analog streams) connect to this original address, not
+  // wherever observable_bridge_v2 ends up redirecting to below — so this
+  // connects right away, ahead of resolving that redirect, rather than
+  // waiting on it for no reason.
   let unredirected_addr = addr.clone();
+  let analog_client = ThalamusClient::connect(unredirected_addr.clone()).await?;
+
+  // A real Thalamus `TaskContext` is constructed once for the whole task
+  // controller session and shared by every trial (`task_controller::run`)
+  // and by the touch/gaze analog streams below (`touch_screen::run`/
+  // `eye_tracking::run`, which push samples into it), rather than each
+  // opening its own. The sound manager is likewise opened once here and
+  // forwarded to it, rather than each `BehaviorTask` opening its own.
+  // `context_tx` hands it back to `main`, which needs the same instance for
+  // `gfx::run`.
+  let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
+    .expect("failed to open default audio device");
+  let context = Arc::new(TaskContext::new(analog_client.clone(), audio_manager));
+  let _ = context_tx.send(context.clone());
 
   let mut app_state = Value::Object(Default::default());
 
@@ -149,25 +181,17 @@ async fn run_grpc(
   };
   let _outbound_keepalive = outbound_keepalive;
 
-  // TOUCH_SCREEN and OCULOMATIC both just hit this same service's `analog`
-  // RPC for different node types, so they share one connection rather than
-  // each dialing their own; the TaskController's `TaskContext` reuses it too,
-  // for logging.
-  let analog_client = ThalamusClient::connect(unredirected_addr.clone()).await?;
-
   // Only now that the observable_bridge_v2 address is resolved (post-redirect,
   // if any) do we connect the TaskController's execution stream, to the same
   // resolved address.
   let task_controller_addr = addr.clone();
-  let touch_current_task = current_task.clone();
-  let gaze_current_task = current_task.clone();
-  let task_controller_thalamus_client = analog_client.clone();
+  let task_controller_context = context.clone();
   tokio::spawn(async move {
     if let Err(e) = task_controller::run(
       task_controller_addr,
       current_task,
       trial_counter,
-      task_controller_thalamus_client,
+      task_controller_context,
     )
     .await
     {
@@ -175,15 +199,14 @@ async fn run_grpc(
     }
   });
 
+  // TOUCH_SCREEN and OCULOMATIC both just hit `analog_client`'s service's
+  // `analog` RPC for different node types, so they share the one connection
+  // opened above rather than each dialing their own.
   let touch_client = analog_client.clone();
+  let touch_context = context.clone();
   tokio::spawn(async move {
-    if let Err(e) = touch_screen::run(
-      touch_client,
-      touch_current_task,
-      window_position,
-      touch_path,
-    )
-    .await
+    if let Err(e) = touch_screen::run(touch_client, touch_context, window_position, touch_path)
+      .await
     {
       tracing::error!("touch screen analog stream failed: {e}");
     }
@@ -194,7 +217,7 @@ async fn run_grpc(
       analog_client,
       gaze_angular_scaling,
       gaze_path,
-      gaze_current_task,
+      context,
       window_size,
     )
     .await

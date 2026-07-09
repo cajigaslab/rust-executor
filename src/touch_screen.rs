@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tonic::transport::Channel;
 
 use crate::analog::last_span_value;
-use crate::behavior_task::SharedTask;
+use crate::behavior_task::TaskContext;
 use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
 
@@ -92,12 +92,12 @@ pub fn shared_touch_path() -> SharedTouchPath {
 /// same service's `analog` RPC for different node types) and forwards each
 /// touch point — translated from screen coordinates to window-local physical
 /// pixels (the same space `BehaviorTask::render` draws into — no further
-/// rescaling needed, see [`SharedWindowSize`]'s doc comment) — to whichever
-/// `BehaviorTask` is currently running (if any), as well as appending it to
-/// `touch_path` for the operator view's touch overlay.
+/// rescaling needed, see [`SharedWindowSize`]'s doc comment) — to `context`
+/// (see `TaskContext::push_touch`), as well as appending it to `touch_path`
+/// for the operator view's touch overlay.
 pub async fn run(
   mut client: ThalamusClient<Channel>,
-  current_task: SharedTask,
+  context: Arc<TaskContext>,
   window_position: SharedWindowPosition,
   touch_path: SharedTouchPath,
 ) -> anyhow::Result<()> {
@@ -124,9 +124,7 @@ pub async fn run(
     let canvas_x = (x - window_x as f64).round() as i32;
     let canvas_y = (y - window_y as f64).round() as i32;
 
-    if let Some(task) = current_task.lock().unwrap().as_ref() {
-      task.on_touch(canvas_x, canvas_y);
-    }
+    context.push_touch((canvas_x, canvas_y));
     touch_path.lock().unwrap().push((canvas_x, canvas_y));
   }
 

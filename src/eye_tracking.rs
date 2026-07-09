@@ -4,7 +4,7 @@ use serde_json::Value;
 use tonic::transport::Channel;
 
 use crate::analog::last_span_value;
-use crate::behavior_task::SharedTask;
+use crate::behavior_task::TaskContext;
 use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
 use crate::touch_screen::{PointRingBuffer, SharedWindowSize};
@@ -193,13 +193,13 @@ fn angular_scaling_process(x: f64, y: f64, pins: &[Pin], scale_default: f64) -> 
 /// `AngularScalingConfig.process`, which reports gaze relative to screen
 /// center) plus `window_size` (to locate that center in the subject window's
 /// current — possibly since-resized — size), appends it to `gaze_path` for
-/// the operator view's gaze overlay, and forwards it to whichever
-/// `BehaviorTask` is currently running (if any), mirroring `touch_screen::run`.
+/// the operator view's gaze overlay, and forwards it to `context` (see
+/// `TaskContext::push_gaze`), mirroring `touch_screen::run`.
 pub async fn run(
   mut client: ThalamusClient<Channel>,
   angular_scaling: SharedAngularScaling,
   gaze_path: SharedGazePath,
-  current_task: SharedTask,
+  context: Arc<TaskContext>,
   window_size: SharedWindowSize,
 ) -> anyhow::Result<()> {
   let request = AnalogRequest {
@@ -231,9 +231,7 @@ pub async fn run(
     let local_x = (scaled_x + window_width as f64 / 2.0).round() as i32;
     let local_y = (scaled_y + window_height as f64 / 2.0).round() as i32;
 
-    if let Some(task) = current_task.lock().unwrap().as_ref() {
-      task.on_gaze(local_x, local_y);
-    }
+    context.push_gaze((local_x, local_y));
     gaze_path.lock().unwrap().push((local_x, local_y));
   }
 
