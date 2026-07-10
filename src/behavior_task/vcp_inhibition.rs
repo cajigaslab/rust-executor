@@ -1436,10 +1436,11 @@ impl BehaviorTask for VcpInhibitionTask {
 
     // Ported from lines 842-853: build the fixation cross path (two
     // perpendicular strokes centered on the screen) in pixel space.
+    let cross_scale = get_f64(config, "cross_scale");
     const VERTICES_DEG: [(f64, f64); 4] = [(-0.25, 0.0), (0.25, 0.0), (0.0, -0.25), (0.0, 0.25)];
     let vertices: Vec<(f64, f64)> = VERTICES_DEG
       .iter()
-      .map(|&(x, y)| state.converter.deg_to_pixel_abs(x, y))
+      .map(|&(x, y)| state.converter.deg_to_pixel_abs(cross_scale*x, cross_scale*y))
       .collect();
 
     let mut cross_builder = PathBuilder::new();
