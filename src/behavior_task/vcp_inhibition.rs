@@ -623,6 +623,9 @@ struct TrialState {
   /// `renderer` closure, which captures `run`'s locals as they were at
   /// definition time, not the (possibly-since-changed) live globals.
   stats: TrialStats,
+  show_target: bool,
+  luminance_targ_per: f64,
+  hide_during_hold: bool
 }
 
 /// Trial-level counters/rates, computed once early in `run` (ported lines
@@ -648,19 +651,12 @@ pub struct VcpInhibitionTask {
   /// `handle_acquire_fixation`). Stored per-trial here, since each
   /// `VcpInhibitionTask` instance already is one trial.
   state: Mutex<Option<State>>,
-  /// Ported from the Python task's `show_target` (nonlocal, closed over by
-  /// `renderer`): whether `render`'s `FailureSaccade` branch should draw
-  /// the target. Only ever toggled by the ACQUIRE_TARGET failure penalty
-  /// (`run`, lines 1388-1391) — off for the first half, on for the second —
-  /// so the target reappears partway through the penalty period.
-  show_target: Mutex<bool>,
   /// The session-wide `TaskContext` passed to `run`, stashed here so
   /// `render` — which (per `BehaviorTask::render`'s contract) isn't itself
   /// passed a `TaskContext` — can still read the latest gaze point via
   /// `TaskContext::gaze` for the operator view's gaze marker/readout. `None`
   /// until `run` is first called.
   context: Mutex<Option<Arc<TaskContext>>>,
-  trial_luminance_targ_per: Mutex<f64>,
 }
 
 impl VcpInhibitionTask {
@@ -668,9 +664,7 @@ impl VcpInhibitionTask {
     Self {
       trial: Mutex::new(None),
       state: Mutex::new(None),
-      show_target: Mutex::new(true),
       context: Mutex::new(None),
-      trial_luminance_targ_per: Mutex::new(0.0),
     }
   }
 
@@ -1265,7 +1259,7 @@ impl VcpInhibitionTask {
   /// equivalent; it's an added parameter (multiplied into the paint's alpha)
   /// so callers can fade the target in/out.
   #[allow(dead_code)]
-  fn draw_gaussian(&self, canvas: &Canvas, alpha: f32) {
+  fn draw_gaussian(&self, canvas: &Canvas, alpha: f64) {
     let Some(trial) = self.trial.lock().unwrap().as_ref().map(|t| {
       (
         t.targetpos_pix,
@@ -1286,7 +1280,7 @@ impl VcpInhibitionTask {
 
     let mut paint = Paint::default();
     paint.set_shader(shader);
-    paint.set_alpha_f(alpha);
+    paint.set_alpha_f(alpha as f32);
     let size = canvas.base_layer_size();
     let (width, height) = (size.width as f32, size.height as f32);
     canvas.draw_rect(
@@ -1473,6 +1467,7 @@ impl BehaviorTask for VcpInhibitionTask {
     let accpt_gaze_radius_pix = state.converter.deg_to_pixel_rel(accpt_gaze_radius_deg);
     let is_height_locked = get_bool(config, "is_height_locked");
     let paint_all_targets = get_bool(config, "paint_all_targets");
+    let hide_during_hold = get_bool(config, "hide_during_hold");
     let target_color_rgb = get_rgb(config, "target_color");
     let background_color = get_rgb(config, "background_color");
     let background_color_qt = Color4f::new(
@@ -1501,7 +1496,6 @@ impl BehaviorTask for VcpInhibitionTask {
       get_nested_f64(config, "luminance_targ_per", "max"),
       get_f64(config, "luminance_targ_step"),
     );
-    *self.trial_luminance_targ_per.lock().unwrap() = luminance_targ_per;
     context
       .log(&format!(
         "trial_summary_data.used_values luminance_targ_per={luminance_targ_per}"
@@ -1634,6 +1628,9 @@ impl BehaviorTask for VcpInhibitionTask {
       accpt_fix_radius_pix,
       accpt_gaze_radius_pix,
       stats: trial_stats,
+      show_target: false,
+      luminance_targ_per,
+      hide_during_hold
     });
 
     match trial_type {
@@ -1897,9 +1894,9 @@ impl BehaviorTask for VcpInhibitionTask {
 
       // Ported from lines 1388-1391: hides the target for the first half of
       // the penalty period, then shows it for the second half.
-      *self.show_target.lock().unwrap() = false;
+      self.trial.lock().unwrap().as_mut().unwrap().show_target = false;
       tokio::time::sleep(Duration::from_secs_f64(penalty_delay / 2.0)).await;
-      *self.show_target.lock().unwrap() = true;
+      self.trial.lock().unwrap().as_mut().unwrap().show_target = true;
       tokio::time::sleep(Duration::from_secs_f64(penalty_delay / 2.0)).await;
 
       return TaskResult {
@@ -2078,6 +2075,9 @@ impl BehaviorTask for VcpInhibitionTask {
       accpt_gaze_radius_pix,
       cross,
       stats,
+      show_target,
+      luminance_targ_per,
+      hide_during_hold,
     )) = self.trial.lock().unwrap().as_ref().map(|t| {
       (
         t.background_color_qt,
@@ -2088,6 +2088,9 @@ impl BehaviorTask for VcpInhibitionTask {
         t.accpt_gaze_radius_pix,
         t.cross.clone(),
         t.stats,
+        t.show_target,
+        t.luminance_targ_per,
+        t.hide_during_hold,
       )
     })
     else {
@@ -2120,7 +2123,7 @@ impl BehaviorTask for VcpInhibitionTask {
       Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0),
       &Paint::new(background_color_qt, None),
     );
-    let off_luminance = *self.trial_luminance_targ_per.lock().unwrap() as f32/100.0;
+    let off_luminance = luminance_targ_per/100.0;
 
     // Line 1049 default; overridden to white in the GO_CUE/PRESENT_TARGET
     // branches below (lines 1115, 1127).
@@ -2181,14 +2184,20 @@ impl BehaviorTask for VcpInhibitionTask {
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         } else {
-          self.draw_gaussian(canvas, off_luminance);
+          if current_state == State::HoldTarget {
+            if !hide_during_hold {
+              self.draw_gaussian(canvas, off_luminance);
+            }
+          } else {
+            self.draw_gaussian(canvas, off_luminance);
+          }
         }
       }
       State::FailureSaccade => {
         // Ported from line 1148: only during the second half of the
         // ACQUIRE_TARGET failure penalty (`show_target` set back to `true`
         // partway through — see `run`) does the target reappear.
-        if *self.show_target.lock().unwrap() && trial_type == TrialType::Saccade {
+        if show_target && trial_type == TrialType::Saccade {
           // Same `draw_gaussian_target` substitution as PRESENT_TARGET's.
           self.draw_gaussian(canvas, 1.0);
         }
