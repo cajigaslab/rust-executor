@@ -70,6 +70,14 @@ impl Converter {
       (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
     )
   }
+
+  /// Converts absolute pixels (top-left origin) to degrees relative to the screen center.
+  fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
+    (
+      (x_pix - self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
+      (y_pix - self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
+    )
+  }
 }
 
 /// The target-location parameters read from config, and the positions
@@ -101,7 +109,6 @@ enum State {
   Fixate,
   PresentTarget,
   #[allow(dead_code)] // matches the Python source's own unused HOLD_TARGET0
-  HoldTarget0,
   Delay,
   GoCue,
   AcquireTarget,
@@ -109,6 +116,7 @@ enum State {
   Success,
   FailureSaccade,
   FailureHold,
+  AbortFixation,
   AbortTarget,
   AbortDelay,
 }
@@ -130,8 +138,11 @@ struct VcpSetup {
   trial_saccade_count: AtomicU64,
   trial_saccade_success_count: AtomicU64,
   trial_saccade_abort_count: AtomicU64,
+  trial_saccade_failure_count: AtomicU64,
   trial_catch_count: AtomicU64,
   trial_catch_success_count: AtomicU64,
+  consecutive_non_success: AtomicU64,
+  background_color_qt: Color4f,
   photodiode_blinking_square: Color4f,
   photodiode_static_square: Color4f,
   success_sound: StaticSoundData,
@@ -151,6 +162,11 @@ struct VcpSetup {
 }
 
 static STATE: OnceLock<VcpSetup> = OnceLock::new();
+
+// Packed RGB background color (r<<16 | g<<8 | b), updated at the very start of
+// every trial's run() so render() can paint the background even before STATE is
+// initialized (first trial) or while a new trial's run() is still setting up.
+static BACKGROUND_COLOR_RGB: AtomicU64 = AtomicU64::new(u64::MAX); // u64::MAX = not set yet
 
 /// Panics rather than defaulting: a missing/malformed field here means the
 /// task config doesn't match what this task requires to run at all, which is
@@ -641,6 +657,7 @@ struct TrialStats {
   trial_catch_count: u64,
   catch_success_rate: f64,
   saccade_trial_abort_rate: f64,
+  saccade_trial_failure_rate: f64,
 }
 
 /// The "VCP_inhibition_task" task's behavior.
@@ -781,6 +798,8 @@ impl VcpInhibitionTask {
     monitorsubj_h_pix: i32,
     stats: &TrialStats,
     penalty_delay: f64,
+    consecutive_penalty_n: u64,
+    consecutive_penalty_delay: f64,
   ) -> TaskResult {
     let valid_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
     state.gaze_failure_store.lock().unwrap().push((
@@ -802,7 +821,7 @@ impl VcpInhibitionTask {
       .fetch_add(1, Ordering::Relaxed);
     context
       .log(&format!(
-        "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%",
+        "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
         stats.trial_num,
         stats.trial_saccade_success_count,
         stats.trial_saccade_count,
@@ -810,11 +829,29 @@ impl VcpInhibitionTask {
         stats.trial_catch_success_count,
         stats.trial_catch_count,
         stats.catch_success_rate,
-        stats.saccade_trial_abort_rate
+        stats.saccade_trial_abort_rate,
+        stats.saccade_trial_failure_rate
       ))
       .await;
 
-    tokio::time::sleep(Duration::from_secs_f64(penalty_delay)).await;
+    let streak = state.consecutive_non_success.fetch_add(1, Ordering::Relaxed) + 1;
+    let extra = if consecutive_penalty_n > 0 && streak >= consecutive_penalty_n {
+      consecutive_penalty_delay
+    } else {
+      0.0
+    };
+    if extra > 0.0 {
+      context
+        .log(&format!(
+          "ConsecutiveNonSuccess={streak}, extra_penalty={}ms",
+          (extra * 1000.0) as u64
+        ))
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+    if extra > 0.0 {
+      state.consecutive_non_success.store(0, Ordering::Relaxed);
+    }
 
     TaskResult {
       success: false,
@@ -833,6 +870,8 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
+    start_duration: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
   ) {
@@ -841,20 +880,22 @@ impl VcpInhibitionTask {
     println!("{:?}", State::AcquireFixation);
 
     self
-      .wait_for(
+      .wait_for_hold(
         context,
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
+        start_duration,
         None,
+        false,
       )
       .await;
   }
 
   /// Ported from `handle_present_target`/`present_target_func` (lines
   /// 502-526, 373-386): sets state to `PresentTarget`, logs it, then waits —
-  /// via `wait_for_hold`, tolerating one blink up to `blink_dur` — for the
+  /// via `wait_for_hold`, tolerating one blink up to `blink_duration` — for the
   /// gaze to hold within `accpt_fix_radius_pix` of `center` (not
   /// `targetpos_pix`) for `present_target_duration`. `accpt_gaze_radius_pix`
   /// and `targetpos_pix` are threaded through only for parity with the
@@ -869,10 +910,10 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
-    _accpt_gaze_radius_pix: f64,
-    _targetpos_pix: (i32, i32),
+    accpt_gaze_radius_pix: f64,
+    targetpos_pix: (i32, i32),
     present_target_duration: Duration,
-    blink_dur: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
@@ -889,7 +930,7 @@ impl VcpInhibitionTask {
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
         present_target_duration,
-        Some(blink_dur),
+        Some(blink_duration),
         false,
       )
       .await;
@@ -928,15 +969,16 @@ impl VcpInhibitionTask {
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
     fix_duration: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
-  ) {
+  ) -> bool {
     *self.state.lock().unwrap() = Some(State::Fixate);
     context.log("BehavState=FIXATE").await;
     println!("{:?}", State::Fixate);
 
-    self
+    let success = self
       .wait_for_hold(
         context,
         gaze_condition(gaze_queue, last_gaze, |point| {
@@ -944,7 +986,7 @@ impl VcpInhibitionTask {
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
         fix_duration,
-        None,
+        Some(blink_duration),
         false,
       )
       .await;
@@ -964,11 +1006,13 @@ impl VcpInhibitionTask {
         temp_gaze_deg.0, temp_gaze_deg.1
       ))
       .await;
+
+      success
   }
 
   /// Ported from `handle_delay`/`delay_func` (lines 529-549, 388-399): sets
   /// state to `Delay`, logs it, then waits — via `wait_for_hold`, tolerating
-  /// one blink up to `blink_dur` — for the gaze to hold within
+  /// one blink up to `blink_duration` — for the gaze to hold within
   /// `accpt_fix_radius_pix` of `center` for `del_duration`, then logs the
   /// post-delay gaze in pixels/degrees. Returns whether the hold succeeded.
   #[allow(clippy::too_many_arguments)]
@@ -980,7 +1024,7 @@ impl VcpInhibitionTask {
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
     del_duration: Duration,
-    blink_dur: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
@@ -998,13 +1042,13 @@ impl VcpInhibitionTask {
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
         del_duration,
-        Some(blink_dur),
+        Some(blink_duration),
         false,
       )
       .await;
-    if now.elapsed() >= del_duration {
-      success = true;
-    }
+    //if now.elapsed() >= del_duration {
+    //  success = true;
+    //}
 
     let gaze = *last_gaze.lock().unwrap();
     let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1028,8 +1072,8 @@ impl VcpInhibitionTask {
   /// Ported from `handle_go_cue_reaction` (lines 552-575): sets state to
   /// `GoCue`, logs it, then waits — via `wait_for_hold`, tolerating one
   /// blink — for the gaze to hold within `go_cue_radius_pix` of `center`
-  /// for a fixed 50ms, succeeding regardless of the hold's own result if
-  /// those 50ms actually elapsed (Python: `if time.perf_counter() - now >
+  /// for a fixed 80ms, succeeding regardless of the hold's own result if
+  /// those 80ms actually elapsed (Python: `if time.perf_counter() - now >
   /// duration_s: success = True`), then logs the post-reaction gaze in
   /// pixels/degrees. Returns whether the check succeeded.
   #[allow(clippy::too_many_arguments)]
@@ -1040,7 +1084,7 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     go_cue_radius_pix: f64,
-    blink_dur: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
@@ -1049,7 +1093,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=GO_CUE").await;
     println!("{:?}", State::GoCue);
 
-    const DURATION: Duration = Duration::from_millis(50);
+    const DURATION: Duration = Duration::from_millis(80);
     let now = Instant::now();
     let mut success = self
       .wait_for_hold(
@@ -1059,13 +1103,13 @@ impl VcpInhibitionTask {
           distance(valid_gaze, center) < go_cue_radius_pix
         }),
         DURATION,
-        Some(blink_dur),
+        Some(Duration::ZERO),
         false,
       )
       .await;
-    if now.elapsed() > DURATION {
-      success = true;
-    }
+    //if now.elapsed() > DURATION {
+    //  success = true;
+    //}
 
     let gaze = *last_gaze.lock().unwrap();
     let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1109,7 +1153,7 @@ impl VcpInhibitionTask {
     _accpt_fix_radius_pix: f64,
     accpt_gaze_radius_pix: f64,
     decision_timeout: Duration,
-    blink_dur: Duration,
+    blink_duration: Duration,
     catch_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
@@ -1129,7 +1173,7 @@ impl VcpInhibitionTask {
               distance(valid_gaze, center) < accpt_gaze_radius_pix
             }),
             catch_duration,
-            Some(blink_dur),
+            Some(blink_duration),
             false,
           )
           .await
@@ -1171,10 +1215,10 @@ impl VcpInhibitionTask {
   /// 426-450): sets state to `HoldTarget`, logs it, then waits for the
   /// trial-type-appropriate hold — catch trials: gaze holds within
   /// `accpt_gaze_radius_pix` of `center` for `hold_target_duration`
-  /// (tolerating one blink up to `blink_dur`, `blink_resets = false`);
+  /// (tolerating one blink up to `blink_duration`, `blink_resets = false`);
   /// saccade trials: gaze holds within `accpt_gaze_radius_pix` of
   /// `targetpos_pix` for `hold_target_duration` (tolerating one blink up to
-  /// `decision_timeout` — not `blink_dur` — with `blink_resets = true`, so
+  /// `decision_timeout` — not `blink_duration` — with `blink_resets = true`, so
   /// any blink restarts the hold from zero) — then logs the post-hold gaze
   /// in pixels/degrees. `accpt_fix_radius_pix` is threaded through only for
   /// parity with the Python signature — `hold_target_func`'s conditions
@@ -1191,7 +1235,7 @@ impl VcpInhibitionTask {
     _accpt_fix_radius_pix: f64,
     accpt_gaze_radius_pix: f64,
     hold_target_duration: Duration,
-    blink_dur: Duration,
+    blink_duration: Duration,
     decision_timeout: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
@@ -1211,7 +1255,7 @@ impl VcpInhibitionTask {
               distance(valid_gaze, center) < accpt_gaze_radius_pix
             }),
             hold_target_duration,
-            Some(blink_dur),
+            Some(blink_duration),
             false,
           )
           .await
@@ -1311,8 +1355,8 @@ impl BehaviorTask for VcpInhibitionTask {
     let config = &context.config();
     let monitorsubj_w_pix = get_i64(config, "monitorsubj_W_pix");
     let monitorsubj_h_pix = get_i64(config, "monitorsubj_H_pix");
-    let monitorsubj_dist_m = get_i64(config, "monitorsubj_dist_m");
-    let monitorsubj_width_m = get_i64(config, "monitorsubj_width_m");
+    let monitorsubj_dist_m = get_f64(config, "monitorsubj_dist_m");
+    let monitorsubj_width_m = get_f64(config, "monitorsubj_width_m");
 
     // Ported from the Python task's `if converter is None:` block (lines
     // 688-741 of VCP_inhibition_task.py): setup that runs only the first
@@ -1323,8 +1367,8 @@ impl BehaviorTask for VcpInhibitionTask {
     if STATE.get().is_none() {
       let converter = Converter::new(
         (monitorsubj_w_pix as u32, monitorsubj_h_pix as u32),
-        monitorsubj_width_m as f64,
-        monitorsubj_dist_m as f64,
+        monitorsubj_width_m,
+        monitorsubj_dist_m,
       );
       let center = (monitorsubj_w_pix as i32 / 2, monitorsubj_h_pix as i32 / 2);
       let center_f = (center.0 as f64, center.1 as f64);
@@ -1341,6 +1385,12 @@ impl BehaviorTask for VcpInhibitionTask {
 
       let target_positions = compute_target_positions(config, &converter, center_f, &context).await;
 
+      let background_color = get_rgb(config, "background_color");
+      {
+        let packed = ((background_color.0 as u64) << 16) | ((background_color.1 as u64) << 8) | (background_color.2 as u64);
+        BACKGROUND_COLOR_RGB.store(packed, Ordering::Relaxed);
+      }
+
       let _ = STATE.set(VcpSetup {
         converter,
         center,
@@ -1349,8 +1399,16 @@ impl BehaviorTask for VcpInhibitionTask {
         trial_saccade_count: AtomicU64::new(0),
         trial_saccade_success_count: AtomicU64::new(0),
         trial_saccade_abort_count: AtomicU64::new(0),
+        trial_saccade_failure_count: AtomicU64::new(0),
         trial_catch_count: AtomicU64::new(0),
         trial_catch_success_count: AtomicU64::new(0),
+        consecutive_non_success: AtomicU64::new(0),
+        background_color_qt: Color4f::new(
+          background_color.0 as f32 / 255.0,
+          background_color.1 as f32 / 255.0,
+          background_color.2 as f32 / 255.0,
+          1.0,
+        ),
         photodiode_blinking_square,
         photodiode_static_square,
         success_sound,
@@ -1464,7 +1522,13 @@ impl BehaviorTask for VcpInhibitionTask {
     // same internally (see `get_value` above).
     let accpt_fix_radius_deg = get_f64(config, "accpt_fix_radius_deg");
     let accpt_fix_radius_pix = state.converter.deg_to_pixel_rel(accpt_fix_radius_deg);
-    let accpt_gaze_radius_deg = get_f64(config, "accpt_gaze_radius_deg");
+    
+    let accpt_gaze_radius_deg = if trial_type == TrialType::Catch {
+      get_f64(config, "accpt_catch_gaze_radius_deg")
+    } else {
+      get_f64(config, "accpt_saccade_gaze_radius_deg")
+    };
+    // let accpt_gaze_radius_deg = get_f64(config, "accpt_gaze_radius_deg");
     let accpt_gaze_radius_pix = state.converter.deg_to_pixel_rel(accpt_gaze_radius_deg);
     let is_height_locked = get_bool(config, "is_height_locked");
     let paint_all_targets = get_bool(config, "paint_all_targets");
@@ -1477,15 +1541,23 @@ impl BehaviorTask for VcpInhibitionTask {
       background_color.2 as f32 / 255.0,
       1.0,
     );
+    {
+      let packed = ((background_color.0 as u64) << 16) | ((background_color.1 as u64) << 8) | (background_color.2 as u64);
+      BACKGROUND_COLOR_RGB.store(packed, Ordering::Relaxed);
+    }
 
     let decision_timeout = get_value(config, &context, "decision_timeout").await / 1000.0;
+    let start_duration = get_f64(config, "start_duration") / 1000.0;
     let fix_duration = get_value(config, &context, "fix_duration").await / 1000.0;
     let del_duration = get_value(config, &context, "del_duration").await / 1000.0;
     let present_target_duration =
       get_value(config, &context, "present_target_duration").await / 1000.0;
     let hold_target_duration = get_value(config, &context, "hold_target_duration").await / 1000.0;
     let penalty_delay = get_f64(config, "penalty_delay") / 1000.0;
-    let blink_dur = get_f64(config, "blink_dur") / 1000.0;
+    let reward_delay = get_f64(config, "reward_delay") / 1000.0;
+    let consecutive_penalty_n = get_f64(config, "consecutive_penalty_n") as u64;
+    let consecutive_penalty_delay = get_f64(config, "consecutive_penalty_delay") / 1000.0;
+    let blink_duration = get_f64(config, "blink_duration") / 1000.0;
     let catch_duration = get_value(config, &context, "catch_duration").await / 1000.0;
 
     println!("{fix_duration} {present_target_duration} {del_duration}");
@@ -1580,15 +1652,19 @@ impl BehaviorTask for VcpInhibitionTask {
 
     let trial_saccade_count = state.trial_saccade_count.load(Ordering::Relaxed);
     let trial_saccade_success_count = state.trial_saccade_success_count.load(Ordering::Relaxed);
-    let (saccade_trial_success_rate, saccade_trial_abort_rate) = if trial_saccade_count == 0 {
-      (0.0, 0.0)
-    } else {
-      let trial_saccade_abort_count = state.trial_saccade_abort_count.load(Ordering::Relaxed);
-      (
-        trial_saccade_success_count as f64 / trial_saccade_count as f64 * 100.0,
-        trial_saccade_abort_count as f64 / trial_saccade_count as f64 * 100.0,
-      )
-    };
+    let (saccade_trial_success_rate, saccade_trial_abort_rate, saccade_trial_failure_rate) =
+      if trial_saccade_count == 0 {
+        (0.0, 0.0, 0.0)
+      } else {
+        let trial_saccade_abort_count = state.trial_saccade_abort_count.load(Ordering::Relaxed);
+        let trial_saccade_failure_count =
+          state.trial_saccade_failure_count.load(Ordering::Relaxed);
+        (
+          trial_saccade_success_count as f64 / trial_saccade_count as f64 * 100.0,
+          trial_saccade_abort_count as f64 / trial_saccade_count as f64 * 100.0,
+          trial_saccade_failure_count as f64 / trial_saccade_count as f64 * 100.0,
+        )
+      };
     let trial_catch_count = state.trial_catch_count.load(Ordering::Relaxed);
     let trial_catch_success_count = state.trial_catch_success_count.load(Ordering::Relaxed);
     let catch_success_rate = if trial_catch_count == 0 {
@@ -1613,6 +1689,7 @@ impl BehaviorTask for VcpInhibitionTask {
       trial_catch_count,
       catch_success_rate,
       saccade_trial_abort_rate,
+      saccade_trial_failure_rate,
     };
 
     *self.trial.lock().unwrap() = Some(TrialState {
@@ -1668,6 +1745,8 @@ impl BehaviorTask for VcpInhibitionTask {
         &last_gaze,
         state.center,
         accpt_fix_radius_pix,
+        Duration::from_secs_f64(start_duration),
+        Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
       )
@@ -1681,7 +1760,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
     // Ported from lines 1248-1258: waits for center fixation to hold for
     // 'fix_duration', then signals FIXATE on 'state_in'.
-    self
+    let fixate_success = self
       .handle_fixate(
         &context,
         &gaze_queue,
@@ -1689,12 +1768,32 @@ impl BehaviorTask for VcpInhibitionTask {
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(fix_duration),
+        Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
       )
       .await;
     context.inject_analog("state_in", state_in_pulse(20)).await;
+
+    if !fixate_success {
+      let gaze = *last_gaze.lock().unwrap();
+      return self
+        .abort_trial(
+          &context,
+          state,
+          gaze,
+          State::AbortFixation,
+          50,
+          monitorsubj_w_pix as i32,
+          monitorsubj_h_pix as i32,
+          &trial_stats,
+          penalty_delay,
+          consecutive_penalty_n,
+          consecutive_penalty_delay,
+        )
+        .await;
+    }
 
     // Ported from lines 1260-1267: waits for continued center fixation
     // through target presentation, then signals PRESENT_TARGET on
@@ -1709,7 +1808,7 @@ impl BehaviorTask for VcpInhibitionTask {
         accpt_gaze_radius_pix,
         targetpos_pix,
         Duration::from_secs_f64(present_target_duration),
-        Duration::from_secs_f64(blink_dur),
+        Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
@@ -1733,6 +1832,8 @@ impl BehaviorTask for VcpInhibitionTask {
           monitorsubj_h_pix as i32,
           &trial_stats,
           penalty_delay,
+          consecutive_penalty_n,
+          consecutive_penalty_delay,
         )
         .await;
     }
@@ -1748,7 +1849,7 @@ impl BehaviorTask for VcpInhibitionTask {
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(del_duration),
-        Duration::from_secs_f64(blink_dur),
+        Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
@@ -1772,6 +1873,8 @@ impl BehaviorTask for VcpInhibitionTask {
           monitorsubj_h_pix as i32,
           &trial_stats,
           penalty_delay,
+          consecutive_penalty_n,
+          consecutive_penalty_delay,
         )
         .await;
     }
@@ -1796,7 +1899,7 @@ impl BehaviorTask for VcpInhibitionTask {
         &last_gaze,
         state.center,
         go_cue_radius_pix,
-        Duration::from_secs_f64(blink_dur),
+        Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
@@ -1820,6 +1923,8 @@ impl BehaviorTask for VcpInhibitionTask {
           monitorsubj_h_pix as i32,
           &trial_stats,
           penalty_delay,
+          consecutive_penalty_n,
+          consecutive_penalty_delay,
         )
         .await;
     }
@@ -1844,7 +1949,7 @@ impl BehaviorTask for VcpInhibitionTask {
         accpt_fix_radius_pix,
         accpt_gaze_radius_pix,
         Duration::from_secs_f64(decision_timeout),
-        Duration::from_secs_f64(blink_dur),
+        Duration::from_secs_f64(blink_duration),
         Duration::from_secs_f64(catch_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
@@ -1877,11 +1982,14 @@ impl BehaviorTask for VcpInhibitionTask {
       println!("{:?}", State::FailureSaccade);
       context.inject_analog("state_in", state_in_pulse(450)).await;
 
+      state
+        .trial_saccade_failure_count
+        .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
         .log(&format!(
-          "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%",
+          "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
           trial_stats.trial_num,
           trial_stats.trial_saccade_success_count,
           trial_stats.trial_saccade_count,
@@ -1889,16 +1997,34 @@ impl BehaviorTask for VcpInhibitionTask {
           trial_stats.trial_catch_success_count,
           trial_stats.trial_catch_count,
           trial_stats.catch_success_rate,
-          trial_stats.saccade_trial_abort_rate
+          trial_stats.saccade_trial_abort_rate,
+          trial_stats.saccade_trial_failure_rate
         ))
         .await;
 
       // Ported from lines 1388-1391: hides the target for the first half of
       // the penalty period, then shows it for the second half.
+      let streak = state.consecutive_non_success.fetch_add(1, Ordering::Relaxed) + 1;
+      let extra = if consecutive_penalty_n > 0 && streak >= consecutive_penalty_n {
+        consecutive_penalty_delay
+      } else {
+        0.0
+      };
+      if extra > 0.0 {
+        context
+          .log(&format!(
+            "ConsecutiveNonSuccess={streak}, extra_penalty={}ms",
+            (extra * 1000.0) as u64
+          ))
+          .await;
+      }
       self.trial.lock().unwrap().as_mut().unwrap().show_target = false;
-      tokio::time::sleep(Duration::from_secs_f64(penalty_delay / 2.0)).await;
+      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
       self.trial.lock().unwrap().as_mut().unwrap().show_target = true;
-      tokio::time::sleep(Duration::from_secs_f64(penalty_delay / 2.0)).await;
+      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
+      if extra > 0.0 {
+        state.consecutive_non_success.store(0, Ordering::Relaxed);
+      }
 
       return TaskResult {
         success: false,
@@ -1919,7 +2045,7 @@ impl BehaviorTask for VcpInhibitionTask {
         accpt_fix_radius_pix,
         accpt_gaze_radius_pix,
         Duration::from_secs_f64(hold_target_duration),
-        Duration::from_secs_f64(blink_dur),
+        Duration::from_secs_f64(blink_duration),
         Duration::from_secs_f64(decision_timeout),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
@@ -1948,11 +2074,14 @@ impl BehaviorTask for VcpInhibitionTask {
       *self.state.lock().unwrap() = Some(State::FailureHold);
       println!("{:?}", State::FailureHold);
 
+      state
+        .trial_saccade_failure_count
+        .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
         .log(&format!(
-          "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%",
+          "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
           trial_stats.trial_num,
           trial_stats.trial_saccade_success_count,
           trial_stats.trial_saccade_count,
@@ -1960,11 +2089,29 @@ impl BehaviorTask for VcpInhibitionTask {
           trial_stats.trial_catch_success_count,
           trial_stats.trial_catch_count,
           trial_stats.catch_success_rate,
-          trial_stats.saccade_trial_abort_rate
+          trial_stats.saccade_trial_abort_rate,
+          trial_stats.saccade_trial_failure_rate
         ))
         .await;
 
-      tokio::time::sleep(Duration::from_secs_f64(penalty_delay)).await;
+      let streak = state.consecutive_non_success.fetch_add(1, Ordering::Relaxed) + 1;
+      let extra = if consecutive_penalty_n > 0 && streak >= consecutive_penalty_n {
+        consecutive_penalty_delay
+      } else {
+        0.0
+      };
+      if extra > 0.0 {
+        context
+          .log(&format!(
+            "ConsecutiveNonSuccess={streak}, extra_penalty={}ms",
+            (extra * 1000.0) as u64
+          ))
+          .await;
+      }
+      tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+      if extra > 0.0 {
+        state.consecutive_non_success.store(0, Ordering::Relaxed);
+      }
 
       return TaskResult {
         success: false,
@@ -1990,12 +2137,14 @@ impl BehaviorTask for VcpInhibitionTask {
       .push((valid_gaze, Color4f::new(0.0, 1.0, 0.0, 128.0 / 255.0)));
 
     context.log("TrialResult=SUCCESS").await;
+    state.consecutive_non_success.store(0, Ordering::Relaxed);
     *self.state.lock().unwrap() = Some(State::Success);
     println!("{:?}", State::Success);
 
     context.play_sound(state.success_sound.clone());
     // 1s delay to allow playing the sound; it doesn't play without this.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(std::time::Duration::from_secs_f64(reward_delay)).await;
 
     let reward_total_released_ms = {
       let mut total = state.reward_total_released_ms.lock().unwrap();
@@ -2036,7 +2185,7 @@ impl BehaviorTask for VcpInhibitionTask {
     };
 
     let summary = format!(
-      "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%",
+      "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
       trial_stats.trial_num,
       trial_saccade_success_count,
       trial_stats.trial_saccade_count,
@@ -2044,10 +2193,14 @@ impl BehaviorTask for VcpInhibitionTask {
       trial_catch_success_count,
       trial_stats.trial_catch_count,
       trial_stats.catch_success_rate,
-      trial_stats.saccade_trial_abort_rate
+      trial_stats.saccade_trial_abort_rate,
+      trial_stats.saccade_trial_failure_rate
     );
     context.log(&summary).await;
     println!("{summary}");
+
+    
+    tokio::time::sleep(std::time::Duration::from_secs_f64(0.35)).await;
 
     // Ported from lines 1448-1450: Python always returns `TaskResult(False)`
     // here, regardless of the trial's outcome — per its own comment, a
@@ -2067,6 +2220,24 @@ impl BehaviorTask for VcpInhibitionTask {
   /// and the `show_target`-gated FAILURE_SACCADE draw (`show_target` isn't
   /// tracked in this port — see `handle_acquire_target`'s doc comment).
   fn render(&self, canvas: &Canvas, window: Window) {
+    // Paint background as the very first thing — even before STATE is ready —
+    // so there is no black flash during first-trial initialization or the
+    // inter-task gap between trials.
+    let packed = BACKGROUND_COLOR_RGB.load(Ordering::Relaxed);
+    if packed != u64::MAX {
+      let bg = Color4f::new(
+        ((packed >> 16) & 0xFF) as f32 / 255.0,
+        ((packed >> 8) & 0xFF) as f32 / 255.0,
+        (packed & 0xFF) as f32 / 255.0,
+        1.0,
+      );
+      canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(bg, None));
+    }
+
+    let Some(setup) = STATE.get() else {
+      return;
+    };
+
     let Some((
       background_color_qt,
       trial_type,
@@ -2097,9 +2268,6 @@ impl BehaviorTask for VcpInhibitionTask {
     else {
       return;
     };
-    let Some(setup) = STATE.get() else {
-      return;
-    };
     let Some(current_state) = *self.state.lock().unwrap() else {
       return;
     };
@@ -2119,11 +2287,7 @@ impl BehaviorTask for VcpInhibitionTask {
       monitorsubj_h_pix as i32,
     );
 
-    // Line 1048.
-    canvas.draw_rect(
-      Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0),
-      &Paint::new(background_color_qt, None),
-    );
+    let _ = background_color_qt; // per-trial value available if needed below
     let off_luminance = luminance_targ_per/100.0;
 
     // Line 1049 default; overridden to white in the GO_CUE/PRESENT_TARGET
@@ -2184,7 +2348,8 @@ impl BehaviorTask for VcpInhibitionTask {
           pen.set_stroke_width(2.0);
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
-        } else {
+        } 
+        else {
           if current_state == State::HoldTarget {
             if !hide_during_hold {
               self.draw_gaussian(canvas, off_luminance);
@@ -2198,10 +2363,10 @@ impl BehaviorTask for VcpInhibitionTask {
         // Ported from line 1148: only during the second half of the
         // ACQUIRE_TARGET failure penalty (`show_target` set back to `true`
         // partway through — see `run`) does the target reappear.
-        if show_target && trial_type == TrialType::Saccade {
-          // Same `draw_gaussian_target` substitution as PRESENT_TARGET's.
-          self.draw_gaussian(canvas, 1.0);
-        }
+        // if show_target && trial_type == TrialType::Saccade {
+        //   // Same `draw_gaussian_target` substitution as PRESENT_TARGET's.
+        //   self.draw_gaussian(canvas, 1.0);
+        // }
       }
       _ => {}
     }
@@ -2222,7 +2387,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // drawn only in the operator view, via this render pass's `window`.
     if window == Window::Operator {
       canvas.draw_rect(
-        Rect::from_xywh(0.0, 0.0, 465.0, 230.0),
+        Rect::from_xywh(0.0, 0.0, 465.0, 260.0),
         &Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), None),
       );
 
@@ -2299,6 +2464,13 @@ impl BehaviorTask for VcpInhibitionTask {
       );
       draw_text(
         canvas,
+        &format!("Saccade_failure_rate= {:.1}%", stats.saccade_trial_failure_rate),
+        0.0,
+        190.0,
+        background_color_qt,
+      );
+      draw_text(
+        canvas,
         &format!("{current_state:?}"),
         valid_gaze.0 as f32,
         valid_gaze.1 as f32,
@@ -2308,7 +2480,7 @@ impl BehaviorTask for VcpInhibitionTask {
         canvas,
         &format!("Gaze (pix): x = {}, y = {}", valid_gaze.0, valid_gaze.1),
         0.0,
-        190.0,
+        220.0,
         background_color_qt,
       );
 

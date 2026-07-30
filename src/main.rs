@@ -251,7 +251,7 @@ fn apply_transaction(
   if eye_scaling_changed {
     eye_tracking::refresh_angular_scaling(app_state, angular_scaling);
   }
-  println!("{}", serde_json::to_string_pretty(app_state)?);
+  //println!("{}", serde_json::to_string_pretty(app_state)?);
   Ok(())
 }
 
