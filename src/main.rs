@@ -40,10 +40,7 @@ fn main() -> anyhow::Result<()> {
 
   // The Thalamus/TaskController gRPC clients run on a background thread with
   // their own Tokio runtime; the windowing/Vulkan render loop below needs the
-  // main thread to itself on most platforms. The render loop invokes
-  // `BehaviorTask::render` via that runtime's `spawn_blocking` + `block_on`
-  // (see `gfx::render_subject_frame`), so the grpc thread sends a `Handle` to
-  // it back once it's built.
+  // main thread to itself on most platforms.
   let grpc_current_task = current_task.clone();
   let grpc_window_position = window_position.clone();
   let grpc_window_size = window_size.clone();
@@ -51,7 +48,6 @@ fn main() -> anyhow::Result<()> {
   let grpc_gaze_path = gaze_path.clone();
   let grpc_angular_scaling = angular_scaling.clone();
   let grpc_trial_counter = trial_counter.clone();
-  let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
   // Sent by `run_grpc` once the session-wide `TaskContext` it builds (see
   // its doc comment) is ready — shortly after the gRPC thread's Tokio
   // runtime starts, not immediately, since building it needs an async
@@ -68,7 +64,6 @@ fn main() -> anyhow::Result<()> {
           return;
         }
       };
-      let _ = handle_tx.send(runtime.handle().clone());
       if let Err(e) = runtime.block_on(run_grpc(
         addr,
         grpc_current_task,
@@ -84,9 +79,6 @@ fn main() -> anyhow::Result<()> {
       }
     })?;
 
-  let tokio_handle = handle_rx
-    .recv()
-    .map_err(|_| anyhow::anyhow!("grpc thread exited before it started its Tokio runtime"))?;
   let context = context_rx
     .recv()
     .map_err(|_| anyhow::anyhow!("grpc thread exited before it built a TaskContext"))?;
@@ -94,7 +86,6 @@ fn main() -> anyhow::Result<()> {
   gfx::run(
     current_task,
     context,
-    tokio_handle,
     window_position,
     window_size,
     touch_path,
