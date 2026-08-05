@@ -2,6 +2,7 @@ mod simple_arc;
 mod task_context;
 mod vcp_inhibition;
 mod vcp_2afc_task;
+mod converter;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -79,7 +80,7 @@ pub fn registry() -> HashMap<String, BehaviorTaskFactory> {
   );
   map.insert(
     "VCP_2AFC_task".to_string(),
-    (|| Arc::new(Vcp2AfcTask::new()) as Arc<dyn Vcp2AfcTask>) as BehaviorTaskFactory,
+    (|| Arc::new(Vcp2AfcTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
   );
   map
 }
