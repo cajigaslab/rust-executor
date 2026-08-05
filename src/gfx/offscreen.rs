@@ -14,7 +14,6 @@ pub struct OffscreenTarget {
   pub view: vk::ImageView,
   pub sampler: vk::Sampler,
   pub extent: vk::Extent2D,
-  pub format: vk::Format,
 }
 
 impl OffscreenTarget {
@@ -97,7 +96,6 @@ impl OffscreenTarget {
       view,
       sampler,
       extent,
-      format: Self::FORMAT,
     })
   }
 

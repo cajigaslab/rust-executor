@@ -3,12 +3,14 @@ mod task_context;
 mod vcp_inhibition;
 mod vcp_2afc_task;
 mod converter;
+mod config_util;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use skia_safe::Canvas;
+use std::time::{Duration, Instant};
 
 use crate::pb::task_controller_grpc::TaskResult;
 
@@ -92,4 +94,74 @@ pub type SharedTask = Arc<Mutex<Option<Arc<dyn BehaviorTask>>>>;
 
 pub fn shared_task() -> SharedTask {
   Arc::new(Mutex::new(None))
+}
+
+async fn wait_for(
+  context: &TaskContext,
+  condition: impl Fn() -> bool,
+  timeout: Option<Duration>,
+) -> bool {
+  let deadline = timeout.map(|d| Instant::now() + d);
+  loop {
+    // Constructed before the check below, per `TaskContext::notify`'s doc
+    // comment, so a push racing with that check isn't missed.
+    let notified = context.notify().notified();
+    if condition() {
+      return true;
+    }
+    match deadline {
+      None => notified.await,
+      Some(deadline) => {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+          return condition();
+        };
+        tokio::select! {
+          _ = notified => {}
+          _ = tokio::time::sleep(remaining) => {}
+        }
+      }
+    }
+  }
+}
+
+async fn wait_for_hold(
+  context: &TaskContext,
+  condition: impl Fn() -> bool,
+  hold_duration: Duration,
+  blink_duration: Option<Duration>,
+  blink_resets: bool,
+) -> bool {
+  let mut start = Instant::now();
+  let mut time_spent_blinking = Duration::ZERO;
+
+  loop {
+    let Some(remaining) = (hold_duration + time_spent_blinking).checked_sub(start.elapsed())
+    else {
+      break;
+    };
+
+    let blinked = 
+      wait_for(context, || !condition(), Some(remaining))
+      .await;
+    if !blinked {
+      break;
+    }
+
+    //context.log("BehavState=blink").await;
+
+    let blink_start = Instant::now();
+    let reacquired = wait_for(context, &condition, blink_duration).await;
+    if !reacquired {
+      return false;
+    }
+
+    if blink_resets {
+      start = Instant::now();
+      time_spent_blinking = Duration::ZERO;
+    } else {
+      time_spent_blinking += blink_start.elapsed();
+    }
+  }
+
+  true
 }

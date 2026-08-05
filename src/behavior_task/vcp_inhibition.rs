@@ -70,14 +70,6 @@ impl Converter {
       (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
     )
   }
-
-  /// Converts absolute pixels (top-left origin) to degrees relative to the screen center.
-  fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
-    (
-      (x_pix - self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
-      (y_pix - self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
-    )
-  }
 }
 
 /// The target-location parameters read from config, and the positions
@@ -871,7 +863,7 @@ impl VcpInhibitionTask {
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
     start_duration: Duration,
-    blink_duration: Duration,
+    _blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
   ) {
@@ -910,8 +902,8 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
-    accpt_gaze_radius_pix: f64,
-    targetpos_pix: (i32, i32),
+    _accpt_gaze_radius_pix: f64,
+    _targetpos_pix: (i32, i32),
     present_target_duration: Duration,
     blink_duration: Duration,
     monitorsubj_w_pix: i32,
@@ -1033,8 +1025,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=DELAY").await;
     println!("{:?}", State::Delay);
 
-    let now = Instant::now();
-    let mut success = self
+    let success = self
       .wait_for_hold(
         context,
         gaze_condition(gaze_queue, last_gaze, |point| {
@@ -1084,7 +1075,7 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     go_cue_radius_pix: f64,
-    blink_duration: Duration,
+    _blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
@@ -1094,8 +1085,7 @@ impl VcpInhibitionTask {
     println!("{:?}", State::GoCue);
 
     const DURATION: Duration = Duration::from_millis(80);
-    let now = Instant::now();
-    let mut success = self
+    let success = self
       .wait_for_hold(
         context,
         gaze_condition(gaze_queue, last_gaze, |point| {
@@ -2247,7 +2237,7 @@ impl BehaviorTask for VcpInhibitionTask {
       accpt_gaze_radius_pix,
       cross,
       stats,
-      show_target,
+      _show_target,
       luminance_targ_per,
       hide_during_hold,
     )) = self.trial.lock().unwrap().as_ref().map(|t| {

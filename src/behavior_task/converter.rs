@@ -1,8 +1,8 @@
 use num_traits::{Float, FloatConst};
 
-pub fn rad_to_deg<F: Float + FloatConst>(rad: F) -> F {
-  rad * F::from(180.0).unwrap() / F::PI()
-}
+//pub fn rad_to_deg<F: Float + FloatConst>(rad: F) -> F {
+//  rad * F::from(180.0).unwrap() / F::PI()
+//}
 
 pub fn deg_to_rad<F: Float + FloatConst>(rad: F) -> F {
   rad * F::PI() / F::from(180.0).unwrap()
@@ -10,7 +10,7 @@ pub fn deg_to_rad<F: Float + FloatConst>(rad: F) -> F {
 
 pub struct Converter {
   deg_per_pixel: f64,
-  screen_pixels: (f64, f64),
+  pub screen_pixels: (f64, f64),
   pub center: (i32, i32)
 }
 
@@ -54,17 +54,17 @@ impl Converter {
     )
   }
 
-  pub fn relpix_to_absdeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
-    (
-      (x_pix + self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
-      (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
-    )
-  }
+  //pub fn relpix_to_absdeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
+  //  (
+  //    (x_pix + self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
+  //    (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
+  //  )
+  //}
 
-  pub fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
-    (
-      (x_pix - self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
-      (y_pix - self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
-    )
-  }
+  //pub fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
+  //  (
+  //    (x_pix - self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
+  //    (y_pix - self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
+  //  )
+  //}
 }

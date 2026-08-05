@@ -141,9 +141,9 @@ impl TaskContext {
 
   /// The most recent touch point, or `None` if none has arrived yet this
   /// session.
-  pub fn touch(&self) -> Option<(i32, i32)> {
-    *self.latest_touch.lock().unwrap()
-  }
+  //pub fn touch(&self) -> Option<(i32, i32)> {
+  //  *self.latest_touch.lock().unwrap()
+  //}
 
   /// The most recent gaze point, or `None` if none has arrived yet this
   /// session.
@@ -176,9 +176,9 @@ impl TaskContext {
   /// Starts a new live feed of every touch point received from now on —
   /// see [`PointSubscription`]. Lets a task see every sample rather than
   /// just [`Self::touch`]'s latest one.
-  pub fn subscribe_to_touch(&self) -> PointSubscription {
-    subscribe(&self.touch_subscribers)
-  }
+  //pub fn subscribe_to_touch(&self) -> PointSubscription {
+  //  subscribe(&self.touch_subscribers)
+  //}
 
   /// Starts a new live feed of every gaze point received from now on — see
   /// [`PointSubscription`]. Lets a task see every sample rather than just
