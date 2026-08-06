@@ -54,12 +54,12 @@ impl Converter {
     )
   }
 
-  //pub fn relpix_to_absdeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
-  //  (
-  //    (x_pix + self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
-  //    (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
-  //  )
-  //}
+  pub fn relpix_to_absdeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
+    (
+      (x_pix + self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
+      (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
+    )
+  }
 
   //pub fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
   //  (

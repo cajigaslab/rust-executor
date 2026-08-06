@@ -55,8 +55,7 @@ pub async fn run(
     );
 
     let result = match registry.get(&task_type) {
-      Some(factory) => {
-        let task = factory();
+      Some(task) => {
         *current_task.lock().unwrap() = Some(task.clone());
 
         // Ported from task_context.py:746,748: logged around every

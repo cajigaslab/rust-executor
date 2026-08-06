@@ -27,26 +27,24 @@ enum State {
   Null,
   AcquireFixation,
   Fixate,
-  PresentTarget,
-  #[allow(dead_code)] // matches the Python source's own unused HOLD_TARGET0
+  SamplePresentation,
   Delay,
-  GoCue,
-  AcquireTarget,
+  ChoicePresentation,
+  AcquireChoice,
+  HoldChoice,
   HoldTarget,
   Success,
   FailureSaccade,
   FailureHold,
-  AbortFixation,
-  AbortTarget,
-  AbortDelay,
+  Abort,
 }
 
 pub struct Vcp2AfcTask {
-  state: Mutex<State>
+  inner: Mutex<Inner>,
 }
 
 #[allow(unused)]
-struct Static {
+struct Inner {
   success_sound: StaticSoundData,
   abort_sound: StaticSoundData,
   failure_sound: StaticSoundData,
@@ -61,15 +59,20 @@ struct Static {
   _loc_sector2_min: i32,
   _loc_sector2_max: i32,
   sample_pos_pix: (i32, i32),
-  converter: Converter,
   loc_correct_idx: i32,
   choice_shapes: Vec<Option<&'static str>>,
   trial_num: i32,
   trial_success_count: i32,
   trial_abort_count: i32,
   trial_failure_count: i32,
+  state: State,
+  gaze_failure_store: Vec<((i32, i32), Color4f)>,
+  gaze_success_store: Vec<((i32, i32), Color4f)>,
+  loc_left_pos: (i32, i32),
+  loc_right_pos: (i32, i32),
+  reward_total_released_ms: i32,
 }
-static STATIC: OnceLock<Mutex<Static>> = OnceLock::new();
+
 #[allow(unused)]
 static PHOTODIODE_BLINKING_SQUARE: Color4f = Color4f::new(1.0, 1.0, 1.0, 1.0);
 #[allow(unused)]
@@ -77,45 +80,22 @@ static PHOTODIODE_STATIC_SQUARE: Color4f = Color4f::new(0.0, 0.0, 0.0, 1.0);
 
 static SHAPES: &[&str] = &["square", "circle", "triangle"];
 
-impl Static {
-  fn new(config: &serde_json::Value) -> Self {
-    let success_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\success_clip.wav").unwrap();
-    let abort_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\failure_clip.wav").unwrap();
-    let failure_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav").unwrap();
-
-    let mut result = Static {
-      success_sound,
-      abort_sound,
-      failure_sound,
-      loc_rand_pos: Vec::<(i32, i32)>::new(),
-      loc_rand_pos_i: 0,
-      _loc_eccentric_circle_num: 0,
-      _loc_polar_step_deg: 0,
-      _loc_ecc_pix_min: 0.0,
-      _loc_ecc_pix_max: 0.0,
-      _loc_sector1_min: 0,
-      _loc_sector1_max: 0,
-      _loc_sector2_min: 0,
-      _loc_sector2_max: 0,
-      sample_pos_pix: (0, 0),
-      converter: Converter::from_config(config),
-      loc_correct_idx: 0,
-      choice_shapes: Vec::<Option<&str>>::new(),
-      trial_num: 0,
-      trial_success_count: 0,
-      trial_abort_count: 0,
-      trial_failure_count: 0,
-    };
-    result.build_loc_rand_pos(config);
-
-    result
+fn reward_pulse(duration_ms: u64) -> AnalogResponse {
+  AnalogResponse {
+    data: vec![5.0, 0.0], // 5 = HIGH, 0 = LOW voltages
+    spans: vec![Span {
+      begin: 0,
+      end: 2,
+      name: "Reward".to_string(),
+      ..Default::default()
+    }],
+    sample_intervals: vec![1_000_000 * duration_ms], // ns
+    ..Default::default()
   }
+}
 
-  fn build_loc_rand_pos(&mut self, config: &serde_json::Value) {
-    let converter = &self.converter;
+impl Inner {
+  fn build_loc_rand_pos(&mut self, config: &serde_json::Value, converter: &Converter) {
     self._loc_eccentric_circle_num = config["loc_eccentric_circle_num"].as_i64().unwrap().try_into().unwrap();
     self._loc_polar_step_deg       = config["loc_polar_step_deg"].as_i64().unwrap().try_into().unwrap();
     self._loc_ecc_pix_min          = converter.deg_to_pixel_rel(config["loc_eccentricity_deg"]["min"].as_f64().unwrap());
@@ -180,16 +160,15 @@ impl Static {
     return (sample_shape, correct_idx.try_into().unwrap())
   }
 
-  fn setup_locations_trial(&mut self, config: &serde_json::Value) -> (i32, i32) {
-    let converter = &self.converter;
+  fn setup_locations_trial(&mut self, config: &serde_json::Value, converter: &Converter) -> (i32, i32) {
     let center = converter.center;
 
     self.sample_pos_pix = self.loc_rand_pos[usize::try_from(self.loc_rand_pos_i).unwrap()];
     self.loc_rand_pos_i += 1;
 
     let ecc_pix = converter.deg_to_pixel_rel(config["choice_eccentricity"].as_f64().unwrap()) as i32;
-    let loc_left_pos  = (center.0 - ecc_pix, center.1);
-    let loc_right_pos = (center.0 + ecc_pix, center.1);
+    self.loc_left_pos  = (center.0 - ecc_pix, center.1);
+    self.loc_right_pos = (center.0 + ecc_pix, center.1);
 
     if self.sample_pos_pix.0 < center.0 {
         self.loc_correct_idx = 0   // left
@@ -200,9 +179,9 @@ impl Static {
     }
 
     if self.loc_correct_idx == 0 {
-      loc_left_pos
+      self.loc_left_pos
     } else {
-      loc_right_pos
+      self.loc_right_pos
     }
   }
 
@@ -238,7 +217,7 @@ impl Static {
       self._loc_sector2_max,
     );
     if old_config != new_config {
-      self.build_loc_rand_pos(config);
+      self.build_loc_rand_pos(config, &converter);
     }
     if usize::try_from(self.loc_rand_pos_i).unwrap() >= self.loc_rand_pos.len() {
       self.loc_rand_pos.shuffle(&mut rand::rng());
@@ -261,11 +240,65 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
   (dx * dx + dy * dy).sqrt()
 }
 
+fn state_in_pulse(duration_ms: u64) -> AnalogResponse {
+  AnalogResponse {
+    data: vec![5.0, 0.0], // 5 = HIGH, 0 = LOW voltages
+    spans: vec![Span {
+      begin: 0,
+      end: 2,
+      name: "Time".to_string(),
+      ..Default::default()
+    }],
+    sample_intervals: vec![1_000_000 * duration_ms], // ns
+    ..Default::default()
+  }
+}
+
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
+    let success_sound =
+      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\success_clip.wav").unwrap();
+    let abort_sound =
+      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\failure_clip.wav").unwrap();
+    let failure_sound =
+      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav").unwrap();
+
     Vcp2AfcTask {
-      state: Mutex::new(State::Null),
+      inner: Mutex::new(Inner {
+        success_sound,
+        abort_sound,
+        failure_sound,
+        loc_rand_pos: vec![],
+        loc_rand_pos_i: 0,
+        _loc_eccentric_circle_num: 0,
+        _loc_polar_step_deg: 0,
+        _loc_ecc_pix_min: 0.0,
+        _loc_ecc_pix_max: 0.0,
+        _loc_sector1_min: 0,
+        _loc_sector1_max: 0,
+        _loc_sector2_min: 0,
+        _loc_sector2_max: 0,
+        sample_pos_pix: (0, 0),
+        loc_correct_idx: 0,
+        choice_shapes: vec![],
+        trial_num: 0,
+        trial_success_count: 0,
+        trial_abort_count: 0,
+        trial_failure_count: 0,
+        state: State::Null,
+        gaze_failure_store: vec![],
+        gaze_success_store: vec![],
+        loc_left_pos: (0, 0),
+        loc_right_pos: (0, 0),
+        reward_total_released_ms: 0
+      }),
     }
+  }
+
+  async fn set_state(&self, context: &TaskContext, text: &str, state: State) {
+    context.log(text).await;
+    self.inner.lock().unwrap().state = state;
+    println!("{:?}", state);
   }
 }
 
@@ -309,12 +342,6 @@ fn get_valid_angles_loc(step_deg: i32, sector1_min: i32, sector1_max: i32, secto
   angles
 }
 
-macro_rules! log {
-  ($context:expr, $($arg:tt)*) => {
-    $context.log(&format!($($arg)*)).await
-  };
-}
-
 fn point_condition<'a>(
   point_queue: &'a PointSubscription,
   last_point_mutex: &'a Mutex<(i32, i32)>,
@@ -354,33 +381,32 @@ impl BehaviorTask for Vcp2AfcTask {
       (f.0 as i32, f.1 as i32)
     }).collect();
 
-    let _static = STATIC.get_or_init(|| Mutex::new(Static::new(config)));
-    _static.lock().unwrap().sync_config(config);
+    self.inner.lock().unwrap().sync_config(config);
 
     let sample_and_choices = if task_group == "Shapes" {
-      let (sample_shape, correct_idx) = _static.lock().unwrap().setup_sample_and_choices(num_choices);
-      let sample_pos_pix = _static.lock().unwrap().sample_pos_pix;
+      let (sample_shape, correct_idx) = self.inner.lock().unwrap().setup_sample_and_choices(num_choices);
+      let sample_pos_pix = self.inner.lock().unwrap().sample_pos_pix;
       let targetpos_pix   = rand_pos[usize::try_from(correct_idx).unwrap()];
       //_static.
       //choice_pos = Some(rand_pos);
       
-      log!(context, "trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0);
-      log!(context, "trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1);
-      log!(context, "trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0);
-      log!(context, "trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1);
-      (Some(sample_shape), Some(correct_idx), sample_pos_pix, targetpos_pix)
+      context.log(&format!("trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0)).await;
+      context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
+      context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
+      context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
+      (Some(sample_shape), correct_idx, sample_pos_pix, targetpos_pix)
     } else {
-      let sample_pos_pix = _static.lock().unwrap().sample_pos_pix;
-      let targetpos_pix = _static.lock().unwrap().setup_locations_trial(config);
-      log!(context, "trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0);
-      log!(context, "trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1);
-      log!(context, "trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0);
-      log!(context, "trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1);
-      (None, None, sample_pos_pix, targetpos_pix)
+      let sample_pos_pix = self.inner.lock().unwrap().sample_pos_pix;
+      let targetpos_pix = self.inner.lock().unwrap().setup_locations_trial(config, &converter);
+      context.log(&format!("trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0)).await;
+      context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
+      context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
+      context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
+      (None, self.inner.lock().unwrap().loc_correct_idx, sample_pos_pix, targetpos_pix)
     };
 
     #[allow(unused)]
-    let (sample_shape, correct_idx, sample_pos_pix, targetpos_pix) = sample_and_choices;
+    let (sample_shape, choice_idx, sample_pos_pix, targetpos_pix) = sample_and_choices;
 
     let cross_scale = 1.0;//get_f64(config, "cross_scale");
     const VERTICES_DEG: [(f64, f64); 4] = [(-0.25, 0.0), (0.25, 0.0), (0.0, -0.25), (0.0, 0.25)];
@@ -443,19 +469,18 @@ impl BehaviorTask for Vcp2AfcTask {
     let choice_present_duration = Duration::from_millis(get_f64(&config["choice_present_duration"]) as u64);
     let choice_hold_duration = Duration::from_millis(get_f64(&config["choice_hold_duration"]) as u64);
     let blink_duration = Duration::from_millis(get_f64(&config["blink_duration"]) as u64);
-    let start_duration = Duration::from_millis(get_f64(&config["start_duration"]) as u64);
 
     let reward_per_trial = get_f64(&config["reward_per_trial"]); // return a uniform random number
                                                                     //
     let luminance_targ_per = get_f64_with_step(&config["luminance_targ_per"], config["luminance_targ_step"].as_f64().unwrap());
-    log!(context, "trial_summary_data.used_values luminance_targ_per={}", luminance_targ_per);
+    context.log(&format!("trial_summary_data.used_values luminance_targ_per={}", luminance_targ_per)).await;
 
     let orientation_targ_ran = get_f64_with_step(&config["orientation_targ_ran"], config["orientation_targ_step"].as_f64().unwrap());
-    log!(context, "trial_summary_data.used_values orientation_targ_ran={}", orientation_targ_ran);
+    context.log(&format!("trial_summary_data.used_values orientation_targ_ran={}", orientation_targ_ran)).await;
 
     let width_targ_deg = get_f64_with_step(&config["width_targ_deg"], config["widthtargdeg_step"].as_f64().unwrap());
     let width_targ_pix = converter.deg_to_pixel_rel(width_targ_deg);
-    log!(context, "trial_summary_data.used_values width_targ_pix={}", width_targ_pix);
+    context.log(&format!("trial_summary_data.used_values width_targ_pix={}", width_targ_pix)).await;
 
     let height_targ_pix = if is_height_locked {
       width_targ_pix
@@ -463,11 +488,11 @@ impl BehaviorTask for Vcp2AfcTask {
       let deg = get_f64_with_step(&config["height_targ_deg"], config["heighttargdeg_step"].as_f64().unwrap());
       converter.deg_to_pixel_rel(deg)
     };
-    log!(context, "trial_summary_data.used_values height_targ_pix={}", height_targ_pix);
-    log!(context, "{}", config.to_string());
+    context.log(&format!("trial_summary_data.used_values height_targ_pix={}", height_targ_pix)).await;
+    context.log(&format!("{}", config.to_string())).await;
 
     let rates = {
-      let lock = _static.lock().unwrap();
+      let lock = self.inner.lock().unwrap();
       if lock.trial_num == 0 {
         (0.0, 0.0, 0.0)
       } else {
@@ -481,23 +506,225 @@ impl BehaviorTask for Vcp2AfcTask {
     let gaze_queue = context.subscribe_to_gaze();
     let last_gaze = Mutex::new((99999, 99999));
 
-    log!(context, "BehavState=ACQUIRE_FIXATION_post-drawing");
-    {
-      let mut state = self.state.lock().unwrap();
-      *state = State::AcquireFixation;
-      println!("{:?}", *state);
-    }
-    wait_for_hold(
+    self.set_state(&context, "BehavState=ACQUIRE_FIXATION_post-drawing", State::AcquireFixation).await;
+    wait_for(
       &context,
       point_condition(&gaze_queue, &last_gaze, |point| {
         let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
         distance(valid_gaze, center) < accpt_fix_radius_pix
       }),
-      start_duration,
       None,
-      false,
     )
     .await;
+
+    self.set_state(&context, "BehavState=FIXATE_post-drawing", State::Fixate).await;
+    wait_for_hold(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          distance(valid_gaze, center) < accpt_fix_radius_pix
+        }),
+        fix_duration,
+        Some(blink_duration),
+        false,
+      )
+      .await;
+
+    {
+      let gaze = *last_gaze.lock().unwrap();
+      let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
+      context.log(&format!("Gaze[X,Y]_pix-abs_after-FIXATE=({}, {})", temp_gaze.0, temp_gaze.1)).await;
+      let temp_gaze_deg = converter.relpix_to_absdeg(temp_gaze.0 as f64, temp_gaze.1 as f64);
+      context.log(&format!("Gaze[X,Y]_deg-abs_after-FIXATE=({}, {})", temp_gaze_deg.0, temp_gaze_deg.1)).await;
+    }
+
+    self.set_state(&context, "BehavState=SAMPLE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::SamplePresentation).await;
+    let present_success = wait_for_hold(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          distance(valid_gaze, center) < accpt_fix_radius_pix
+        }),
+        sample_present_duration,
+        Some(blink_duration),
+        false,
+      )
+      .await;
+
+    let trial_num = {
+      let mut inner = self.inner.lock().unwrap();
+      inner.trial_num += 1;
+      inner.trial_num
+    };
+    println!("Started trial # {trial_num}");
+    context.log(&format!("StartedTRIAL_NUM={trial_num}")).await; // saving any variables / data from code
+
+    if !present_success {
+      self.set_state(&context, "TrialResult=ABORT", State::Abort).await;
+      let mut lock = self.inner.lock().unwrap();
+      context.play_sound(lock.abort_sound.clone());
+      lock.trial_abort_count += 1;
+      let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
+      let trial_success_count = lock.trial_success_count;
+      context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
+                            SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
+      
+      tokio::time::sleep(penalty_delay).await;
+      return TaskResult { success: false, cancelled: false };
+    }
+    
+    self.set_state(&context, "BehavState=DELAY", State::Delay).await;
+    wait_for_hold(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          distance(valid_gaze, center) < accpt_fix_radius_pix
+        }),
+        del_duration,
+        Some(blink_duration),
+        false,
+      )
+      .await;
+
+    self.set_state(&context, "BehavState=CHOICE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::ChoicePresentation).await;
+    let choice_success = wait_for_hold(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          distance(valid_gaze, center) < accpt_fix_radius_pix
+        }),
+        choice_present_duration,
+        Some(blink_duration),
+        false,
+      )
+      .await;
+
+    if !choice_success {
+      self.set_state(&context, "TrialResult=ABORT", State::Abort).await;
+      let mut lock = self.inner.lock().unwrap();
+      context.play_sound(lock.abort_sound.clone());
+      lock.trial_abort_count += 1;
+      let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
+      let trial_success_count = lock.trial_success_count;
+      context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
+                            SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
+      
+      tokio::time::sleep(penalty_delay).await;
+      return TaskResult { success: false, cancelled: false };
+    }
+
+    let wrong_positions = if task_group == "Shapes" {
+      rand_pos.iter().enumerate().filter_map(|(i, p)| {
+        if i as i32 != choice_idx { Some(*p) } else { None }
+      }).collect()
+    } else if task_group == "Locations" {
+      let mut lock = self.inner.lock().unwrap();
+      if choice_idx == 0 { vec![lock.loc_right_pos] } else { vec![lock.loc_left_pos] }
+    } else {
+      Vec::<(i32, i32)>::new()
+    };
+
+    self.set_state(&context, "BehavState=ACQUIRE_CHOICE_start", State::AcquireChoice).await;
+    let acquire_success = wait_for(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          for pos in &wrong_positions {
+            if distance(valid_gaze, *pos) < accpt_gaze_radius_pix {
+              return true;
+            }
+          }
+          if distance(valid_gaze, targetpos_pix) < accpt_gaze_radius_pix {
+            return true;
+          }
+          false
+        }),
+        Some(decision_timeout)
+      )
+      .await;
+    let correct_selection = {
+      let point = last_gaze.lock().unwrap();
+      let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+      distance(valid_gaze, targetpos_pix) < accpt_gaze_radius_pix
+    };
+
+    let acquire_gaze = *last_gaze.lock().unwrap();
+    {
+      let temp_gaze = gaze_valid(acquire_gaze.0, acquire_gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
+      context.log(&format!("Gaze[X,Y]_pix-abs_after-acquiring-target={temp_gaze:?}")).await;
+      let temp_gaze_deg = converter.relpix_to_absdeg(temp_gaze.0 as f64, temp_gaze.1 as f64);
+      context.log(&format!("Gaze[X,Y]_deg-abs_after-acquiring-target={temp_gaze_deg:?}")).await;
+    }
+
+    if !(acquire_success && correct_selection) {
+      self.set_state(&context, "TrialResult=FAILURE", State::Abort).await;
+      let mut lock = self.inner.lock().unwrap();
+      lock.gaze_failure_store.push(
+        (gaze_valid(acquire_gaze.0, acquire_gaze.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+      context.play_sound(lock.failure_sound.clone());
+      lock.trial_failure_count += 1;
+      let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
+      let trial_success_count = lock.trial_success_count;
+      context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
+                            SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
+      
+      tokio::time::sleep(penalty_delay).await;
+      return TaskResult { success: false, cancelled: false };
+    }
+
+    self.set_state(&context, "BehavState=HOLD_CHOICE_start", State::HoldChoice).await;
+    let choice_success = wait_for_hold(
+        &context,
+        point_condition(&gaze_queue, &last_gaze, |point| {
+          let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
+          distance(valid_gaze, center) < accpt_gaze_radius_pix
+        }),
+        choice_hold_duration,
+        Some(blink_duration),
+        false,
+      )
+      .await;
+
+    if !choice_success {
+      self.set_state(&context, "TrialResult=FAILURE", State::Abort).await;
+      let mut lock = self.inner.lock().unwrap();
+      let g = *last_gaze.lock().unwrap();
+      lock.gaze_failure_store.push(
+        (gaze_valid(g.0, g.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+      context.play_sound(lock.failure_sound.clone());
+      lock.trial_failure_count += 1;
+      let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
+      let trial_success_count = lock.trial_success_count;
+      context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
+                            SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
+      
+      tokio::time::sleep(penalty_delay).await;
+      return TaskResult { success: false, cancelled: false };
+    }
+
+    let gaze = *last_gaze.lock().unwrap();
+    let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
+    context.log(&format!("Gaze[X,Y]_pix-abs_after-holding-target={temp_gaze:?}")).await;
+    let temp_gaze_deg = converter.relpix_to_absdeg(temp_gaze.0 as f64, temp_gaze.1 as f64);
+    context.log(&format!("Gaze[X,Y]_deg-abs_after-holding-target={temp_gaze_deg:?}")).await;
+
+    self.inner.lock().unwrap().gaze_success_store.push((temp_gaze, Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+    self.set_state(&context, "TrialResult=SUCCESS", State::Success).await;
+    context.play_sound(self.inner.lock().unwrap().success_sound.clone());
+    
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    self.inner.lock().unwrap().reward_total_released_ms += reward_per_trial as i32;
+    context.log(&format!("starting_reward_release_of = {} ms, total_released = {} ms", self.inner.lock().unwrap().reward_total_released_ms, reward_per_trial)).await;
+
+    context
+      .inject_analog("reward_in", reward_pulse(reward_per_trial as u64))
+      .await;
+
+    self.inner.lock().unwrap().trial_success_count += 1;
+    let trial_success_count = self.inner.lock().unwrap().trial_success_count;
+    let new_trial_success_rate = (self.inner.lock().unwrap().trial_success_count as f64)/(trial_num as f64)*100.0;
+    context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
+                          SUCCESS_RATE={new_trial_success_rate}, ABORT_RATE={trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
 
     TaskResult { success: true, cancelled: false }
   }

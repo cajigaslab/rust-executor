@@ -1329,6 +1329,10 @@ impl VcpInhibitionTask {
 #[async_trait]
 impl BehaviorTask for VcpInhibitionTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
+    self.trial.lock().unwrap().take();
+    self.state.lock().unwrap().take();
+    self.context.lock().unwrap().take();
+    
     // Stashed so `render` — which isn't itself passed a `TaskContext` (see
     // `BehaviorTask::render`'s doc comment) — can still show the latest
     // gaze point in the operator view.

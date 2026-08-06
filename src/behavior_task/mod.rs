@@ -64,25 +64,21 @@ pub trait BehaviorTask: Send + Sync {
   fn operator_widget(&self, _ui: &imgui::Ui) {}
 }
 
-/// Creates a fresh [`BehaviorTask`] instance for one trial of a given
-/// `task_type`.
-pub type BehaviorTaskFactory = fn() -> Arc<dyn BehaviorTask>;
-
 /// Maps `task_type` (from `TaskConfig.body`) to the factory that creates the
 /// `BehaviorTask` implementing that type's behavior.
-pub fn registry() -> HashMap<String, BehaviorTaskFactory> {
-  let mut map: HashMap<String, BehaviorTaskFactory> = HashMap::new();
+pub fn registry() -> HashMap<String, Arc<dyn BehaviorTask>> {
+  let mut map: HashMap<String, Arc<dyn BehaviorTask>> = HashMap::new();
   map.insert(
     "simple".to_string(),
-    (|| Arc::new(SimpleArcTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
+    Arc::new(SimpleArcTask::new()),
   );
   map.insert(
     "VCP_inhibition_task".to_string(),
-    (|| Arc::new(VcpInhibitionTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
+    Arc::new(VcpInhibitionTask::new()),
   );
   map.insert(
     "VCP_2AFC_task".to_string(),
-    (|| Arc::new(Vcp2AfcTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
+    Arc::new(Vcp2AfcTask::new()),
   );
   map
 }
