@@ -19,7 +19,8 @@ use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait
 
 #[allow(unused)]
 use skia_safe::{
-  Canvas, Color4f, Font, FontMgr, Paint, PaintStyle, Path, PathBuilder, Rect, Shader, TileMode, PathDirection, Point
+  Canvas, Color4f, Font, FontMgr, Paint, PaintStyle, Path, PathBuilder, Rect, Shader, TileMode, PathDirection, Point,
+  Color
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -71,6 +72,20 @@ struct Inner {
   loc_left_pos: (i32, i32),
   loc_right_pos: (i32, i32),
   reward_total_released_ms: i32,
+  background_color: Color4f,
+  paint_all_targets: bool,
+  target_color_rgb: Color4f,
+  cross: Path,
+  square: Path,
+  triangle: Path,
+  circle: Path,
+  task_group: String,
+  sample_shape: String,
+  gaussian: Option<Shader>,
+  orientation_targ_ran: f64,
+  width_targ_pix: f64,
+  height_targ_pix: f64,
+  rand_pos: Vec<(i32, i32)>,
 }
 
 #[allow(unused)]
@@ -290,7 +305,21 @@ impl Vcp2AfcTask {
         gaze_success_store: vec![],
         loc_left_pos: (0, 0),
         loc_right_pos: (0, 0),
-        reward_total_released_ms: 0
+        reward_total_released_ms: 0,
+        background_color: Color4f::new(0.0, 0.0, 0.0, 0.0),
+        paint_all_targets: false,
+        target_color_rgb: Color4f::new(0.0, 0.0, 0.0, 0.0),
+        task_group: "".to_string(),
+        circle: Path::new(),
+        square: Path::new(),
+        cross: Path::new(),
+        triangle: Path::new(),
+        sample_shape: "".to_string(),
+        gaussian: None,
+        orientation_targ_ran: 0.0,
+        width_targ_pix: 0.0,
+        height_targ_pix: 0.0,
+        rand_pos: vec![],
       }),
     }
   }
@@ -360,6 +389,49 @@ fn point_condition<'a>(
   }
 }
 
+fn gaussian_gradient_shader(
+  background_color: Color4f,
+  radius: f32,
+  deviations: f32,
+  brightness_in: f32,
+  luminance_percent: f32,
+) -> Shader {
+  const RESOLUTION: usize = 1000;
+  let bg_r = background_color.r * 255.0;
+  let bg_g = background_color.g * 255.0;
+  let bg_b = background_color.b * 255.0;
+  let brightness = (brightness_in - bg_r) * luminance_percent / 100.0 + bg_r;
+
+  let mut colors: Vec<Color4f> = (0..RESOLUTION)
+    .map(|i| {
+      let t = deviations * i as f32 / RESOLUTION as f32;
+      let level = if bg_r == 0.0 && bg_g == 0.0 && bg_b == 0.0 {
+        brightness * (-(t * t) / 2.0).exp()
+      } else {
+        bg_r + (brightness - bg_r) * (-(t * t) / 2.0).exp()
+      };
+      let level = level.trunc() / 255.0;
+      Color4f::new(level, level, level, 1.0)
+    })
+    .collect();
+  colors.push(Color4f::new(
+    background_color.r,
+    background_color.g,
+    background_color.b,
+    0.0,
+  ));
+
+  let mut positions: Vec<f32> = (0..RESOLUTION)
+    .map(|i| i as f32 / RESOLUTION as f32)
+    .collect();
+  positions.push(1.0);
+
+  let gradient_colors = GradientColors::new(&colors, Some(&positions), TileMode::Clamp, None);
+  let gradient = Gradient::new(gradient_colors, Interpolation::default());
+  gradient_shaders::radial_gradient(((0.0, 0.0), radius), &gradient, None)
+    .expect("failed to build gaussian gradient shader")
+}
+
 #[async_trait]
 impl BehaviorTask for Vcp2AfcTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
@@ -394,7 +466,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
-      (Some(sample_shape), correct_idx, sample_pos_pix, targetpos_pix)
+      (sample_shape, correct_idx, sample_pos_pix, targetpos_pix)
     } else {
       let sample_pos_pix = self.inner.lock().unwrap().sample_pos_pix;
       let targetpos_pix = self.inner.lock().unwrap().setup_locations_trial(config, &converter);
@@ -402,7 +474,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
-      (None, self.inner.lock().unwrap().loc_correct_idx, sample_pos_pix, targetpos_pix)
+      ("", self.inner.lock().unwrap().loc_correct_idx, sample_pos_pix, targetpos_pix)
     };
 
     #[allow(unused)]
@@ -420,7 +492,7 @@ impl BehaviorTask for Vcp2AfcTask {
     cross_builder.line_to((vertices[1].0 as f32, vertices[1].1 as f32));
     cross_builder.move_to((vertices[2].0 as f32, vertices[2].1 as f32));
     cross_builder.line_to((vertices[3].0 as f32, vertices[3].1 as f32));
-    let _cross: Path = cross_builder.detach();
+    let cross: Path = cross_builder.detach();
 
     // Build shape paths — size controlled by sample_size_deg (half-width in degrees)
     let s = config["sample_size_deg"].as_f64().unwrap() / 2.0;
@@ -433,7 +505,7 @@ impl BehaviorTask for Vcp2AfcTask {
     square_builder.line_to((square_vertices[2].0 as f32, square_vertices[2].1 as f32));
     square_builder.line_to((square_vertices[3].0 as f32, square_vertices[3].1 as f32));
     square_builder.close();
-    let _square = square_builder.detach();
+    let square = square_builder.detach();
   
     let triangle_deg = vec![(0.0, -s/2.0), (s/2.0, s/2.0), (-s/2.0, s/2.0)];
     let triangle_vertices: Vec<(f64, f64)> = triangle_deg.iter().copied().map(|(x, y)|converter.deg_to_pixel_abs(x, y)).collect();
@@ -442,13 +514,13 @@ impl BehaviorTask for Vcp2AfcTask {
     triangle_builder.line_to((triangle_vertices[1].0 as f32, triangle_vertices[1].1 as f32));
     triangle_builder.line_to((triangle_vertices[2].0 as f32, triangle_vertices[2].1 as f32));
     triangle_builder.close();
-    let _triangle = triangle_builder.detach();
+    let triangle = triangle_builder.detach();
   
     let (x0, y0) = square_vertices[0];
     let (x2, y2) = square_vertices[2];
     let mut circle_builder = PathBuilder::new();
     circle_builder.add_oval(Rect::from_ltrb(x0 as f32, y0 as f32, x2 as f32, y2 as f32), PathDirection::CW, 0);
-    let _circle = circle_builder.detach();
+    let circle = circle_builder.detach();
 
     let accpt_fix_radius_deg = config["accpt_fix_radius_deg"].as_i64().unwrap();
     let accpt_fix_radius_pix = converter.deg_to_pixel_rel(accpt_fix_radius_deg as f64);
@@ -471,7 +543,21 @@ impl BehaviorTask for Vcp2AfcTask {
     let blink_duration = Duration::from_millis(get_f64(&config["blink_duration"]) as u64);
 
     let reward_per_trial = get_f64(&config["reward_per_trial"]); // return a uniform random number
-                                                                    //
+
+    {
+      let mut lock = self.inner.lock().unwrap();
+      lock.background_color = background_color;
+      lock.paint_all_targets = paint_all_targets;
+      lock.target_color_rgb = target_color_rgb;
+      lock.cross = cross;
+      lock.square = square;
+      lock.triangle = triangle;
+      lock.circle = circle;
+      lock.task_group = task_group.to_string();
+      lock.sample_shape = sample_shape.to_string();
+      lock.rand_pos = rand_pos.clone();
+    }
+
     let luminance_targ_per = get_f64_with_step(&config["luminance_targ_per"], config["luminance_targ_step"].as_f64().unwrap());
     context.log(&format!("trial_summary_data.used_values luminance_targ_per={}", luminance_targ_per)).await;
 
@@ -489,6 +575,16 @@ impl BehaviorTask for Vcp2AfcTask {
       converter.deg_to_pixel_rel(deg)
     };
     context.log(&format!("trial_summary_data.used_values height_targ_pix={}", height_targ_pix)).await;
+
+    let gaussian = gaussian_gradient_shader(background_color, (width_targ_pix/2.0) as f32,
+                   3.0, 255.0, luminance_targ_per as f32);
+
+    {
+      let mut lock = self.inner.lock().unwrap();
+      lock.gaussian = Some(gaussian);
+      lock.orientation_targ_ran = orientation_targ_ran;
+    }
+
     context.log(&format!("{}", config.to_string())).await;
 
     let rates = {
@@ -618,7 +714,7 @@ impl BehaviorTask for Vcp2AfcTask {
         if i as i32 != choice_idx { Some(*p) } else { None }
       }).collect()
     } else if task_group == "Locations" {
-      let mut lock = self.inner.lock().unwrap();
+      let lock = self.inner.lock().unwrap();
       if choice_idx == 0 { vec![lock.loc_right_pos] } else { vec![lock.loc_left_pos] }
     } else {
       Vec::<(i32, i32)>::new()
@@ -729,8 +825,193 @@ impl BehaviorTask for Vcp2AfcTask {
     TaskResult { success: true, cancelled: false }
   }
 
-  fn render(&self, _canvas: &Canvas, _window: Window) {
+  fn render(&self, canvas: &Canvas, _window: Window) {
+    let (
+      state,
+      background_color,
+      off_opacity,
+      cross,
+      square,
+      circle,
+      triangle,
+      task_group,
+      sample_shape,
+      sample_pos_pix,
+      gaussian,
+      orientation_targ_ran,
+      width_targ_pix,
+      height_targ_pix,
+      rand_pos,
+      choice_shapes,
+      loc_left_pos,
+      loc_right_pos,
+    ) = {
+      let lock = self.inner.lock().unwrap();
+      (lock.state,
+       lock.background_color,
+       1.0,
+       lock.cross,
+       lock.square,
+       lock.circle,
+       lock.triangle,
+       lock.task_group,
+       lock.sample_shape,
+       lock.sample_pos_pix,
+       lock.gaussian,
+       lock.orientation_targ_ran,
+       lock.width_targ_pix,
+       lock.height_targ_pix,
+       lock.rand_pos.clone(),
+       lock.choice_shapes.clone(),
+       lock.loc_left_pos,
+       lock.loc_right_pos,
+       )
+    };
+    canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(background_color, None));
+    let canvas_size = canvas.base_layer_size();
+    let canvas_center = (canvas_size.width/2, canvas_size.height/2);
+    canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(background_color, None));
+
+    let mut current_photodiode_static_square = PHOTODIODE_STATIC_SQUARE;
+
+    let gaussian2 = gaussian.clone();
+    let draw_gaussian = move |pos: (i32, i32)| {
+      canvas.save();
+
+      canvas.translate(pos);
+      canvas.rotate(orientation_targ_ran as f32, None);
+      canvas.scale((1.0, (height_targ_pix / width_targ_pix) as f32));
+
+      let mut paint = Paint::default();
+      paint.set_shader(gaussian2);
+      let (width, height) = (canvas_size.width as f32, canvas_size.height as f32);
+      canvas.draw_rect(
+        Rect::from_xywh(-width / 2.0, -height / 2.0, width, height),
+        &paint,
+      );
+
+      canvas.restore();
+    };
+
+    match state {
+      State::Null => {}
+      State::AcquireFixation | State::Fixate => {
+        let pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+      },
+      State::SamplePresentation => {
+        let mut pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+        if task_group == "Shapes" {
+          pen.set_color4f(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
+          canvas.save();
+          canvas.translate(sample_pos_pix);
+          match sample_shape.as_str() {
+            "triangle" => {
+              canvas.draw_path(&triangle, &pen);
+            }
+            "circle" => {
+              canvas.draw_path(&circle, &pen);
+            }
+            "squaure" => {
+              canvas.draw_path(&square, &pen);
+            }
+            _ => {}
+          };
+          canvas.restore();
+        } else {
+          if let Some(g) = gaussian {
+            draw_gaussian(sample_pos_pix);
+          }
+        }
+        current_photodiode_static_square = PHOTODIODE_BLINKING_SQUARE;
+      },
+      State::Delay => {
+        let mut pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+      },
+      State::ChoicePresentation => {
+        let mut pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+        if task_group == "Shapes" {
+          pen.set_color4f(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
+
+          for (shape, pos) in choice_shapes.iter().zip(rand_pos) {
+            canvas.save();
+            canvas.translate((pos.0-canvas_center.0, pos.1-canvas_center.1));
+            match sample_shape.as_str() {
+              "triangle" => {
+                canvas.draw_path(&triangle, &pen);
+              }
+              "circle" => {
+                canvas.draw_path(&circle, &pen);
+              }
+              "squaure" => {
+                canvas.draw_path(&square, &pen);
+              }
+              _ => {}
+            };
+            canvas.restore();
+          }
+        } else {
+          draw_gaussian(loc_left_pos);
+          draw_gaussian(loc_right_pos);
+        }
+      },
+      State::HoldChoice | State::AcquireChoice => {
+        let mut pen = Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        if task_group == "Shapes" {
+          for (shape, pos) in choice_shapes.iter().zip(rand_pos) {
+            canvas.save();
+            canvas.translate((pos.0-canvas_center.0, pos.1-canvas_center.1));
+            match sample_shape.as_str() {
+              "triangle" => {
+                canvas.draw_path(&triangle, &pen);
+              }
+              "circle" => {
+                canvas.draw_path(&circle, &pen);
+              }
+              "squaure" => {
+                canvas.draw_path(&square, &pen);
+              }
+              _ => {}
+            };
+            canvas.restore();
+          }
+        } else {
+          draw_gaussian(loc_left_pos);
+          draw_gaussian(loc_right_pos);
+        }
+      },
+      _ => {}
+    }
     todo!()
   }
 }
 
+  //Null,
+  //SamplePresentation,
+  //Delay,
+  //ChoicePresentation,
+  //AcquireChoice,
+  //HoldChoice,
+  //HoldTarget,
+  //Success,
+  //FailureSaccade,
+  //FailureHold,
+  //Abort,
