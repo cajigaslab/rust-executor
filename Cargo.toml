@@ -29,6 +29,7 @@ naga = { version = "26", features = ["wgsl-in", "spv-out"] }
 ndarray = "0.17.2"
 num-traits = "0.2.19"
 itertools = "0.15.0"
+parking_lot = "0.12.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

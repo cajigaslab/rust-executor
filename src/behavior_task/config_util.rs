@@ -5,7 +5,7 @@ use skia_safe::{
 use serde_json;
 use itertools;
 
-use rand::seq::{IndexedRandom, SliceRandom};
+use rand::seq::{IndexedRandom};
 
 pub fn get_color(value: &serde_json::Value) -> Color4f {
   let r = value.as_f64().unwrap()/255.0;

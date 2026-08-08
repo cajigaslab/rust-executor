@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use ndarray;
 use itertools::{iproduct};
 use std::time::{Duration};
+use parking_lot;
 
 use async_trait::async_trait;
 use kira::sound::static_sound::StaticSoundData;
@@ -23,6 +24,10 @@ use skia_safe::{
   Color
 };
 
+use skia_safe::gradient::{
+  Colors as GradientColors, Gradient, Interpolation, shaders as gradient_shaders,
+};
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum State {
   Null,
@@ -33,15 +38,12 @@ enum State {
   ChoicePresentation,
   AcquireChoice,
   HoldChoice,
-  HoldTarget,
   Success,
-  FailureSaccade,
-  FailureHold,
   Abort,
 }
 
 pub struct Vcp2AfcTask {
-  inner: Mutex<Inner>,
+  inner: parking_lot::Mutex<Inner>,
 }
 
 #[allow(unused)]
@@ -86,6 +88,10 @@ struct Inner {
   width_targ_pix: f64,
   height_targ_pix: f64,
   rand_pos: Vec<(i32, i32)>,
+  accpt_gaze_radius_pix: f64,
+  targetpos_pix: (i32, i32),
+  accpt_fix_radius_pix: f64,
+  gaze: (i32, i32),
 }
 
 #[allow(unused)]
@@ -255,20 +261,6 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
   (dx * dx + dy * dy).sqrt()
 }
 
-fn state_in_pulse(duration_ms: u64) -> AnalogResponse {
-  AnalogResponse {
-    data: vec![5.0, 0.0], // 5 = HIGH, 0 = LOW voltages
-    spans: vec![Span {
-      begin: 0,
-      end: 2,
-      name: "Time".to_string(),
-      ..Default::default()
-    }],
-    sample_intervals: vec![1_000_000 * duration_ms], // ns
-    ..Default::default()
-  }
-}
-
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
@@ -279,7 +271,7 @@ impl Vcp2AfcTask {
       StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav").unwrap();
 
     Vcp2AfcTask {
-      inner: Mutex::new(Inner {
+      inner: parking_lot::Mutex::new(Inner {
         success_sound,
         abort_sound,
         failure_sound,
@@ -320,13 +312,17 @@ impl Vcp2AfcTask {
         width_targ_pix: 0.0,
         height_targ_pix: 0.0,
         rand_pos: vec![],
+        accpt_gaze_radius_pix: 0.0,
+        targetpos_pix: (0, 0),
+        accpt_fix_radius_pix: 0.0,
+        gaze: (0, 0),
       }),
     }
   }
 
   async fn set_state(&self, context: &TaskContext, text: &str, state: State) {
     context.log(text).await;
-    self.inner.lock().unwrap().state = state;
+    self.inner.lock().state = state;
     println!("{:?}", state);
   }
 }
@@ -371,14 +367,14 @@ fn get_valid_angles_loc(step_deg: i32, sector1_min: i32, sector1_max: i32, secto
   angles
 }
 
-fn point_condition<'a>(
+fn point_condition<'a, 'b>(
   point_queue: &'a PointSubscription,
-  last_point_mutex: &'a Mutex<(i32, i32)>,
+  last_point_mutex: impl Fn() -> parking_lot::MappedMutexGuard<'b, (i32, i32)> + 'a,
   within: impl Fn((i32, i32)) -> bool + 'a,
 ) -> impl Fn() -> bool + 'a {
   move || {
     let mut satisfied = false;
-    let mut last_point = last_point_mutex.lock().unwrap();
+    let mut last_point = last_point_mutex();
     for point in point_queue.drain() {
       *last_point = point;
       if within(point) {
@@ -432,6 +428,43 @@ fn gaussian_gradient_shader(
     .expect("failed to build gaussian gradient shader")
 }
 
+static RENDER_FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
+
+fn render_font() -> &'static Font {
+  static FONT: OnceLock<Font> = OnceLock::new();
+  FONT.get_or_init(|| {
+    let typeface = FontMgr::new()
+      .new_from_data(RENDER_FONT_DATA, None)
+      .expect("bundled DejaVuSans.ttf should parse as a valid font");
+    Font::from_typeface(typeface, 18.0)
+  })
+}
+
+fn draw_text(canvas: &Canvas, text: &str, x: f32, y: f32, background_color_qt: Color4f) {
+  let is_black =
+    background_color_qt.r == 0.0 && background_color_qt.g == 0.0 && background_color_qt.b == 0.0;
+  let (foreground, background) = if is_black {
+    (
+      Color4f::new(1.0, 1.0, 1.0, 1.0),
+      Color4f::new(0.0, 0.0, 0.0, 1.0),
+    )
+  } else {
+    (
+      Color4f::new(0.0, 0.0, 0.0, 1.0),
+      Color4f::new(1.0, 1.0, 1.0, 1.0),
+    )
+  };
+
+  canvas.draw_rect(
+    Rect::from_xywh(x, y, 320.0, 26.0),
+    &Paint::new(background, None),
+  );
+
+  let mut foreground_paint = Paint::new(foreground, None);
+  foreground_paint.set_anti_alias(true);
+  canvas.draw_str(text, (x + 4.0, y + 19.0), render_font(), &foreground_paint);
+}
+
 #[async_trait]
 impl BehaviorTask for Vcp2AfcTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
@@ -453,11 +486,11 @@ impl BehaviorTask for Vcp2AfcTask {
       (f.0 as i32, f.1 as i32)
     }).collect();
 
-    self.inner.lock().unwrap().sync_config(config);
+    self.inner.lock().sync_config(config);
 
     let sample_and_choices = if task_group == "Shapes" {
-      let (sample_shape, correct_idx) = self.inner.lock().unwrap().setup_sample_and_choices(num_choices);
-      let sample_pos_pix = self.inner.lock().unwrap().sample_pos_pix;
+      let (sample_shape, correct_idx) = self.inner.lock().setup_sample_and_choices(num_choices);
+      let sample_pos_pix = self.inner.lock().sample_pos_pix;
       let targetpos_pix   = rand_pos[usize::try_from(correct_idx).unwrap()];
       //_static.
       //choice_pos = Some(rand_pos);
@@ -468,13 +501,13 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
       (sample_shape, correct_idx, sample_pos_pix, targetpos_pix)
     } else {
-      let sample_pos_pix = self.inner.lock().unwrap().sample_pos_pix;
-      let targetpos_pix = self.inner.lock().unwrap().setup_locations_trial(config, &converter);
+      let sample_pos_pix = self.inner.lock().sample_pos_pix;
+      let targetpos_pix = self.inner.lock().setup_locations_trial(config, &converter);
       context.log(&format!("trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0)).await;
       context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_y_pix={}", sample_pos_pix.1)).await;
-      ("", self.inner.lock().unwrap().loc_correct_idx, sample_pos_pix, targetpos_pix)
+      ("", self.inner.lock().loc_correct_idx, sample_pos_pix, targetpos_pix)
     };
 
     #[allow(unused)]
@@ -526,7 +559,6 @@ impl BehaviorTask for Vcp2AfcTask {
     let accpt_fix_radius_pix = converter.deg_to_pixel_rel(accpt_fix_radius_deg as f64);
     let accpt_gaze_radius_deg = config["accpt_gaze_radius_deg"].as_i64().unwrap();
     let accpt_gaze_radius_pix = converter.deg_to_pixel_rel(accpt_gaze_radius_deg as f64);
-    let choice_eccentricity = converter.deg_to_pixel_rel(choice_eccentricity);
     let is_height_locked = config["is_height_locked"].as_bool().unwrap();
     let paint_all_targets = config["paint_all_targets"].as_bool().unwrap();
     let target_color_rgb = get_color(&config["target_color"]);
@@ -545,7 +577,7 @@ impl BehaviorTask for Vcp2AfcTask {
     let reward_per_trial = get_f64(&config["reward_per_trial"]); // return a uniform random number
 
     {
-      let mut lock = self.inner.lock().unwrap();
+      let mut lock = self.inner.lock();
       lock.background_color = background_color;
       lock.paint_all_targets = paint_all_targets;
       lock.target_color_rgb = target_color_rgb;
@@ -556,6 +588,9 @@ impl BehaviorTask for Vcp2AfcTask {
       lock.task_group = task_group.to_string();
       lock.sample_shape = sample_shape.to_string();
       lock.rand_pos = rand_pos.clone();
+      lock.accpt_gaze_radius_pix = accpt_gaze_radius_pix;
+      lock.targetpos_pix = targetpos_pix;
+      lock.accpt_fix_radius_pix = accpt_fix_radius_pix;
     }
 
     let luminance_targ_per = get_f64_with_step(&config["luminance_targ_per"], config["luminance_targ_step"].as_f64().unwrap());
@@ -580,7 +615,7 @@ impl BehaviorTask for Vcp2AfcTask {
                    3.0, 255.0, luminance_targ_per as f32);
 
     {
-      let mut lock = self.inner.lock().unwrap();
+      let mut lock = self.inner.lock();
       lock.gaussian = Some(gaussian);
       lock.orientation_targ_ran = orientation_targ_ran;
     }
@@ -588,7 +623,7 @@ impl BehaviorTask for Vcp2AfcTask {
     context.log(&format!("{}", config.to_string())).await;
 
     let rates = {
-      let lock = self.inner.lock().unwrap();
+      let lock = self.inner.lock();
       if lock.trial_num == 0 {
         (0.0, 0.0, 0.0)
       } else {
@@ -597,15 +632,19 @@ impl BehaviorTask for Vcp2AfcTask {
          (lock.trial_failure_count as f64)/(lock.trial_num as f64)*100.0)
       }
     };
-    let (trial_success_rate, trial_abort_rate, trial_failure_rate) = rates;
+    let (trial_success_rate, _trial_abort_rate, trial_failure_rate) = rates;
 
     let gaze_queue = context.subscribe_to_gaze();
-    let last_gaze = Mutex::new((99999, 99999));
+    let get_gaze = || {
+      parking_lot::MutexGuard::map(self.inner.lock(), |v| {
+        &mut v.gaze
+      })
+    };
 
     self.set_state(&context, "BehavState=ACQUIRE_FIXATION_post-drawing", State::AcquireFixation).await;
     wait_for(
       &context,
-      point_condition(&gaze_queue, &last_gaze, |point| {
+      point_condition(&gaze_queue, get_gaze, |point| {
         let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
         distance(valid_gaze, center) < accpt_fix_radius_pix
       }),
@@ -616,7 +655,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=FIXATE_post-drawing", State::Fixate).await;
     wait_for_hold(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
@@ -627,7 +666,7 @@ impl BehaviorTask for Vcp2AfcTask {
       .await;
 
     {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = self.inner.lock().gaze;
       let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
       context.log(&format!("Gaze[X,Y]_pix-abs_after-FIXATE=({}, {})", temp_gaze.0, temp_gaze.1)).await;
       let temp_gaze_deg = converter.relpix_to_absdeg(temp_gaze.0 as f64, temp_gaze.1 as f64);
@@ -637,7 +676,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=SAMPLE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::SamplePresentation).await;
     let present_success = wait_for_hold(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
@@ -648,7 +687,7 @@ impl BehaviorTask for Vcp2AfcTask {
       .await;
 
     let trial_num = {
-      let mut inner = self.inner.lock().unwrap();
+      let mut inner = self.inner.lock();
       inner.trial_num += 1;
       inner.trial_num
     };
@@ -657,11 +696,15 @@ impl BehaviorTask for Vcp2AfcTask {
 
     if !present_success {
       self.set_state(&context, "TrialResult=ABORT", State::Abort).await;
-      let mut lock = self.inner.lock().unwrap();
-      context.play_sound(lock.abort_sound.clone());
-      lock.trial_abort_count += 1;
-      let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
-      let trial_success_count = lock.trial_success_count;
+
+      let (new_trial_abort_rate, trial_success_count) = {
+        let mut lock = self.inner.lock();
+        context.play_sound(lock.abort_sound.clone());
+        lock.trial_abort_count += 1;
+        let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
+        let trial_success_count = lock.trial_success_count;
+        (new_trial_abort_rate, trial_success_count)
+      };
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
@@ -672,7 +715,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=DELAY", State::Delay).await;
     wait_for_hold(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
@@ -685,7 +728,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=CHOICE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::ChoicePresentation).await;
     let choice_success = wait_for_hold(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
         }),
@@ -697,11 +740,14 @@ impl BehaviorTask for Vcp2AfcTask {
 
     if !choice_success {
       self.set_state(&context, "TrialResult=ABORT", State::Abort).await;
-      let mut lock = self.inner.lock().unwrap();
-      context.play_sound(lock.abort_sound.clone());
-      lock.trial_abort_count += 1;
-      let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
-      let trial_success_count = lock.trial_success_count;
+      let (new_trial_abort_rate, trial_success_count) = {
+        let mut lock = self.inner.lock();
+        context.play_sound(lock.abort_sound.clone());
+        lock.trial_abort_count += 1;
+        let new_trial_abort_rate = (lock.trial_abort_count as f64)/(trial_num as f64)*100.0;
+        let trial_success_count = lock.trial_success_count;
+        (new_trial_abort_rate, trial_success_count)
+      };
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
@@ -714,7 +760,7 @@ impl BehaviorTask for Vcp2AfcTask {
         if i as i32 != choice_idx { Some(*p) } else { None }
       }).collect()
     } else if task_group == "Locations" {
-      let lock = self.inner.lock().unwrap();
+      let lock = self.inner.lock();
       if choice_idx == 0 { vec![lock.loc_right_pos] } else { vec![lock.loc_left_pos] }
     } else {
       Vec::<(i32, i32)>::new()
@@ -723,7 +769,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=ACQUIRE_CHOICE_start", State::AcquireChoice).await;
     let acquire_success = wait_for(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           for pos in &wrong_positions {
             if distance(valid_gaze, *pos) < accpt_gaze_radius_pix {
@@ -739,12 +785,12 @@ impl BehaviorTask for Vcp2AfcTask {
       )
       .await;
     let correct_selection = {
-      let point = last_gaze.lock().unwrap();
+      let point = self.inner.lock().gaze;
       let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
       distance(valid_gaze, targetpos_pix) < accpt_gaze_radius_pix
     };
 
-    let acquire_gaze = *last_gaze.lock().unwrap();
+    let acquire_gaze = self.inner.lock().gaze;
     {
       let temp_gaze = gaze_valid(acquire_gaze.0, acquire_gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
       context.log(&format!("Gaze[X,Y]_pix-abs_after-acquiring-target={temp_gaze:?}")).await;
@@ -754,13 +800,16 @@ impl BehaviorTask for Vcp2AfcTask {
 
     if !(acquire_success && correct_selection) {
       self.set_state(&context, "TrialResult=FAILURE", State::Abort).await;
-      let mut lock = self.inner.lock().unwrap();
-      lock.gaze_failure_store.push(
-        (gaze_valid(acquire_gaze.0, acquire_gaze.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
-      context.play_sound(lock.failure_sound.clone());
-      lock.trial_failure_count += 1;
-      let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
-      let trial_success_count = lock.trial_success_count;
+      let (new_trial_failure_rate, trial_success_count) = {
+        let mut lock = self.inner.lock();
+        lock.gaze_failure_store.push(
+          (gaze_valid(acquire_gaze.0, acquire_gaze.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+        context.play_sound(lock.failure_sound.clone());
+        lock.trial_failure_count += 1;
+        let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
+        let trial_success_count = lock.trial_success_count;
+        (new_trial_failure_rate, trial_success_count)
+      };
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
@@ -771,7 +820,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "BehavState=HOLD_CHOICE_start", State::HoldChoice).await;
     let choice_success = wait_for_hold(
         &context,
-        point_condition(&gaze_queue, &last_gaze, |point| {
+        point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_gaze_radius_pix
         }),
@@ -783,14 +832,18 @@ impl BehaviorTask for Vcp2AfcTask {
 
     if !choice_success {
       self.set_state(&context, "TrialResult=FAILURE", State::Abort).await;
-      let mut lock = self.inner.lock().unwrap();
-      let g = *last_gaze.lock().unwrap();
-      lock.gaze_failure_store.push(
-        (gaze_valid(g.0, g.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
-      context.play_sound(lock.failure_sound.clone());
-      lock.trial_failure_count += 1;
-      let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
-      let trial_success_count = lock.trial_success_count;
+
+      let (new_trial_failure_rate, trial_success_count) = {
+        let mut lock = self.inner.lock();
+        let g = self.inner.lock().gaze;
+        lock.gaze_failure_store.push(
+          (gaze_valid(g.0, g.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+        context.play_sound(lock.failure_sound.clone());
+        lock.trial_failure_count += 1;
+        let new_trial_failure_rate = (lock.trial_failure_count as f64)/(trial_num as f64)*100.0;
+        let trial_success_count = lock.trial_success_count;
+        (new_trial_failure_rate, trial_success_count)
+      };
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
@@ -798,38 +851,37 @@ impl BehaviorTask for Vcp2AfcTask {
       return TaskResult { success: false, cancelled: false };
     }
 
-    let gaze = *last_gaze.lock().unwrap();
+    let gaze = self.inner.lock().gaze;
     let temp_gaze = gaze_valid(gaze.0, gaze.1, monitorsubj_w_pix, monitorsubj_h_pix);
     context.log(&format!("Gaze[X,Y]_pix-abs_after-holding-target={temp_gaze:?}")).await;
     let temp_gaze_deg = converter.relpix_to_absdeg(temp_gaze.0 as f64, temp_gaze.1 as f64);
     context.log(&format!("Gaze[X,Y]_deg-abs_after-holding-target={temp_gaze_deg:?}")).await;
 
-    self.inner.lock().unwrap().gaze_success_store.push((temp_gaze, Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
+    self.inner.lock().gaze_success_store.push((temp_gaze, Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
     self.set_state(&context, "TrialResult=SUCCESS", State::Success).await;
-    context.play_sound(self.inner.lock().unwrap().success_sound.clone());
+    context.play_sound(self.inner.lock().success_sound.clone());
     
     tokio::time::sleep(Duration::from_secs(1)).await;
-    self.inner.lock().unwrap().reward_total_released_ms += reward_per_trial as i32;
-    context.log(&format!("starting_reward_release_of = {} ms, total_released = {} ms", self.inner.lock().unwrap().reward_total_released_ms, reward_per_trial)).await;
+    self.inner.lock().reward_total_released_ms += reward_per_trial as i32;
+    context.log(&format!("starting_reward_release_of = {} ms, total_released = {} ms", self.inner.lock().reward_total_released_ms, reward_per_trial)).await;
 
     context
       .inject_analog("reward_in", reward_pulse(reward_per_trial as u64))
       .await;
 
-    self.inner.lock().unwrap().trial_success_count += 1;
-    let trial_success_count = self.inner.lock().unwrap().trial_success_count;
-    let new_trial_success_rate = (self.inner.lock().unwrap().trial_success_count as f64)/(trial_num as f64)*100.0;
+    self.inner.lock().trial_success_count += 1;
+    let trial_success_count = self.inner.lock().trial_success_count;
+    let new_trial_success_rate = (self.inner.lock().trial_success_count as f64)/(trial_num as f64)*100.0;
     context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                           SUCCESS_RATE={new_trial_success_rate}, ABORT_RATE={trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
 
     TaskResult { success: true, cancelled: false }
   }
 
-  fn render(&self, canvas: &Canvas, _window: Window) {
+  fn render(&self, canvas: &Canvas, window: Window) {
     let (
       state,
       background_color,
-      off_opacity,
       cross,
       square,
       circle,
@@ -845,19 +897,27 @@ impl BehaviorTask for Vcp2AfcTask {
       choice_shapes,
       loc_left_pos,
       loc_right_pos,
+      accpt_gaze_radius_pix,
+      targetpos_pix,
+      accpt_fix_radius_pix,
+      gaze,
+      trial_num,
+      trial_success_count,
+      trial_abort_count,
+      trial_failure_count,
+      reward_total_released_ms,
     ) = {
-      let lock = self.inner.lock().unwrap();
+      let lock = self.inner.lock();
       (lock.state,
        lock.background_color,
-       1.0,
-       lock.cross,
-       lock.square,
-       lock.circle,
-       lock.triangle,
-       lock.task_group,
-       lock.sample_shape,
+       lock.cross.clone(),
+       lock.square.clone(),
+       lock.circle.clone(),
+       lock.triangle.clone(),
+       lock.task_group.clone(),
+       lock.sample_shape.clone(),
        lock.sample_pos_pix,
-       lock.gaussian,
+       lock.gaussian.clone(),
        lock.orientation_targ_ran,
        lock.width_targ_pix,
        lock.height_targ_pix,
@@ -865,6 +925,15 @@ impl BehaviorTask for Vcp2AfcTask {
        lock.choice_shapes.clone(),
        lock.loc_left_pos,
        lock.loc_right_pos,
+       lock.accpt_gaze_radius_pix,
+       lock.targetpos_pix,
+       lock.accpt_fix_radius_pix,
+       lock.gaze,
+       lock.trial_num,
+       lock.trial_success_count,
+       lock.trial_abort_count,
+       lock.trial_failure_count,
+       lock.reward_total_released_ms,
        )
     };
     canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(background_color, None));
@@ -874,7 +943,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     let mut current_photodiode_static_square = PHOTODIODE_STATIC_SQUARE;
 
-    let gaussian2 = gaussian.clone();
+    let gaussian_ref = &gaussian;
     let draw_gaussian = move |pos: (i32, i32)| {
       canvas.save();
 
@@ -883,7 +952,7 @@ impl BehaviorTask for Vcp2AfcTask {
       canvas.scale((1.0, (height_targ_pix / width_targ_pix) as f32));
 
       let mut paint = Paint::default();
-      paint.set_shader(gaussian2);
+      paint.set_shader(gaussian_ref.clone());
       let (width, height) = (canvas_size.width as f32, canvas_size.height as f32);
       canvas.draw_rect(
         Rect::from_xywh(-width / 2.0, -height / 2.0, width, height),
@@ -896,7 +965,7 @@ impl BehaviorTask for Vcp2AfcTask {
     match state {
       State::Null => {}
       State::AcquireFixation | State::Fixate => {
-        let pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
+        let mut pen = Paint::new(Color4f::new(0.5, 0.0, 0.5, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
         pen.set_stroke_width(2.0);
         pen.set_anti_alias(true);
@@ -926,7 +995,7 @@ impl BehaviorTask for Vcp2AfcTask {
           };
           canvas.restore();
         } else {
-          if let Some(g) = gaussian {
+          if gaussian.is_some() {
             draw_gaussian(sample_pos_pix);
           }
         }
@@ -951,14 +1020,14 @@ impl BehaviorTask for Vcp2AfcTask {
           for (shape, pos) in choice_shapes.iter().zip(rand_pos) {
             canvas.save();
             canvas.translate((pos.0-canvas_center.0, pos.1-canvas_center.1));
-            match sample_shape.as_str() {
-              "triangle" => {
+            match shape {
+              Some("triangle") => {
                 canvas.draw_path(&triangle, &pen);
               }
-              "circle" => {
+              Some("circle") => {
                 canvas.draw_path(&circle, &pen);
               }
-              "squaure" => {
+              Some("squaure") => {
                 canvas.draw_path(&square, &pen);
               }
               _ => {}
@@ -979,14 +1048,14 @@ impl BehaviorTask for Vcp2AfcTask {
           for (shape, pos) in choice_shapes.iter().zip(rand_pos) {
             canvas.save();
             canvas.translate((pos.0-canvas_center.0, pos.1-canvas_center.1));
-            match sample_shape.as_str() {
-              "triangle" => {
+            match shape {
+              Some("triangle") => {
                 canvas.draw_path(&triangle, &pen);
               }
-              "circle" => {
+              Some("circle") => {
                 canvas.draw_path(&circle, &pen);
               }
-              "squaure" => {
+              Some("squaure") => {
                 canvas.draw_path(&square, &pen);
               }
               _ => {}
@@ -1000,9 +1069,75 @@ impl BehaviorTask for Vcp2AfcTask {
       },
       _ => {}
     }
-    todo!()
+
+    canvas.draw_rect(
+      Rect::from_xywh(
+        canvas_size.width as f32 - 50.0,
+        canvas_size.height as f32 - 50.0,
+        500.0,
+        500.0,
+      ),
+      &Paint::new(current_photodiode_static_square, None),
+    );
+
+    if window == Window::Operator {
+      let shading_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 80.0 / 255.0), None);
+      canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 465.0, 230.0), &Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), None));
+
+      if task_group == "Locations" && loc_left_pos != (0, 0) {
+        canvas.draw_circle(
+          (loc_left_pos.0 as f32, loc_left_pos.1 as f32),
+          accpt_gaze_radius_pix as f32,
+          &shading_paint,
+        );
+        canvas.draw_circle(
+          (loc_right_pos.0 as f32, loc_right_pos.1 as f32),
+          accpt_gaze_radius_pix as f32,
+          &shading_paint,
+        );
+        canvas.draw_circle(
+          (targetpos_pix.0 as f32, targetpos_pix.1 as f32),
+          accpt_gaze_radius_pix as f32,
+          &Paint::new(Color4f::new(0.0, 1.0, 0.0, 100.0 / 255.0), None),
+        );
+      } else {
+        canvas.draw_circle(
+          (targetpos_pix.0 as f32, targetpos_pix.1 as f32),
+          accpt_gaze_radius_pix as f32,
+          &Paint::new(Color4f::new(1.0, 1.0, 1.0, 128.0 / 255.0), None),
+        );
+      }
+      canvas.draw_circle(
+        (canvas_center.0 as f32, canvas_center.1 as f32),
+        accpt_fix_radius_pix as f32,
+        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 128.0 / 255.0), None),
+      );
+
+      canvas.draw_circle(
+        gaze,
+        12.0,
+        &Paint::new(Color4f::new(138.0 / 255.0, 43.0 / 255.0, 226.0 / 255.0, 1.0), None),
+      );
+
+      draw_text(canvas, &format!("{state:?}"), 0.0, 10.0, background_color); // Draw the text message
+      draw_text(canvas, &format!("Trial_num = {trial_num}"), 0.0, 40.0, background_color); // Draw the text message
+      draw_text(canvas, &format!("Result = {trial_success_count} / {trial_num}"), 0.0, 70.0, background_color); // Draw the text message
+      draw_text(canvas, &format!("Abort_rate = {trial_abort_count} / {trial_num}"), 0.0, 100.0, background_color); // Draw the text message
+      draw_text(canvas, &format!("Failure_rate = {trial_failure_count} / {trial_num}"), 0.0, 130.0, background_color); // Draw the text message
+      draw_text(canvas, &format!("Total_reward = {reward_total_released_ms} ms"), 0.0, 160.0, background_color); // Draw the text message
+      let (temp_gaze_x, temp_gaze_y) = gaze_valid(gaze.0, gaze.1, canvas_size.width, canvas_size.height);
+      let drawn_text = &format!("({temp_gaze_x}, {temp_gaze_y})");
+      draw_text(canvas, drawn_text, temp_gaze_x as f32, temp_gaze_y as f32, background_color); // Draw the text message
+      draw_text(canvas, "Gaze (pix): x = {temp_gaze_x}, y = {temp_gaze_y}", 0.0, 190.0, background_color);
+    }
   }
 }
+//  def draw_gaze(painter, gaze_qpoint, color_rgba):
+//    path = QPainterPath()
+//    gaze_f = QPointF(gaze_qpoint)
+//    path.addEllipse(gaze_f, 12, 12)
+//    painter.fillPath(path, color_rgba) 
+
 
   //Null,
   //SamplePresentation,

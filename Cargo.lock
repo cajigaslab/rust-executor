@@ -2365,6 +2365,7 @@ dependencies = [
  "naga",
  "ndarray",
  "num-traits",
+ "parking_lot",
  "prost",
  "protox",
  "rand",
