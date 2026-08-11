@@ -141,6 +141,14 @@ struct VcpSetup {
   trial_saccade_failure_count: AtomicU64,
   trial_catch_count: AtomicU64,
   trial_catch_success_count: AtomicU64,
+  /// Aborts/failures that occur on a `TrialType::Catch` trial — kept
+  /// separate from `trial_saccade_abort_count`/`trial_saccade_failure_count`
+  /// so catch-trial events never inflate the saccade-only abort/failure
+  /// rates. Not currently surfaced as their own rate, since nothing reads
+  /// them for that; they exist purely to keep catch trials from bleeding
+  /// into the saccade counters.
+  trial_catch_abort_count: AtomicU64,
+  trial_catch_failure_count: AtomicU64,
   consecutive_non_success: AtomicU64,
   background_color_qt: Color4f,
   photodiode_blinking_square: Color4f,
@@ -286,34 +294,52 @@ fn pick_random_value(min_val: f64, max_val: f64, step: f64) -> f64 {
     .expect("pick_random_value: empty range of possible values")
 }
 
-/// Ported from the Python task's `gaussian_gradient` (lines 49-63): builds a
-/// radial "Gaussian" falloff shader — grayscale brightness decaying from the
-/// center toward `background_color`'s red channel (matching the Python
-/// source's use of only the red channel for brightness), fully transparent
-/// at the outer edge.
+/// Ported from the Python task's `gaussian_gradient` (lines 49-63), extended
+/// to actually apply `target_color` (the Python source, and this port until
+/// now, only ever passed a fixed white/255 "brightness" here, so the target
+/// always rendered grayscale regardless of the `target_color` config field —
+/// see `target_color_rgb` at this function's call site): builds a radial
+/// "Gaussian" falloff shader per color channel, decaying from `target_color`
+/// at the center to `background_color` at the edge, fully transparent at the
+/// outer edge.
 fn gaussian_gradient_shader(
   background_color: Color4f,
   radius: f32,
   deviations: f32,
-  brightness_in: f32,
+  target_color: (f64, f64, f64),
   luminance_percent: f32,
 ) -> Shader {
   const RESOLUTION: usize = 1000;
-  let bg_r = background_color.r * 255.0;
-  let bg_g = background_color.g * 255.0;
-  let bg_b = background_color.b * 255.0;
-  let brightness = (brightness_in - bg_r) * luminance_percent / 100.0 + bg_r;
+  let bg = [
+    background_color.r * 255.0,
+    background_color.g * 255.0,
+    background_color.b * 255.0,
+  ];
+  let target = [
+    target_color.0 as f32,
+    target_color.1 as f32,
+    target_color.2 as f32,
+  ];
+  let brightness = [
+    (target[0] - bg[0]) * luminance_percent / 100.0 + bg[0],
+    (target[1] - bg[1]) * luminance_percent / 100.0 + bg[1],
+    (target[2] - bg[2]) * luminance_percent / 100.0 + bg[2],
+  ];
+  let bg_is_black = bg[0] == 0.0 && bg[1] == 0.0 && bg[2] == 0.0;
 
   let mut colors: Vec<Color4f> = (0..RESOLUTION)
     .map(|i| {
       let t = deviations * i as f32 / RESOLUTION as f32;
-      let level = if bg_r == 0.0 && bg_g == 0.0 && bg_b == 0.0 {
-        brightness * (-(t * t) / 2.0).exp()
-      } else {
-        bg_r + (brightness - bg_r) * (-(t * t) / 2.0).exp()
+      let falloff = (-(t * t) / 2.0).exp();
+      let channel = |c: usize| {
+        let level = if bg_is_black {
+          brightness[c] * falloff
+        } else {
+          bg[c] + (brightness[c] - bg[c]) * falloff
+        };
+        level.trunc() / 255.0
       };
-      let level = level.trunc() / 255.0;
-      Color4f::new(level, level, level, 1.0)
+      Color4f::new(channel(0), channel(1), channel(2), 1.0)
     })
     .collect();
   colors.push(Color4f::new(
@@ -783,7 +809,10 @@ impl VcpInhibitionTask {
   /// Ported from the abort/failure block repeated after PRESENT_TARGET
   /// (lines 1272-1290) and DELAY (lines 1301-1321): records the failed
   /// gaze, logs the abort, plays `abort_sound`, bumps
-  /// `trial_saccade_abort_count`, logs the trial summary, sleeps
+  /// `trial_saccade_abort_count` (or `trial_catch_abort_count`, per
+  /// `trial_type` — these stages run before the catch/saccade branch point,
+  /// so a catch trial can abort here too, and must not inflate the
+  /// saccade-only abort rate), logs the trial summary, sleeps
   /// `penalty_delay`, and returns the failing `TaskResult` (Python's
   /// `return TaskResult(False)`).
   #[allow(clippy::too_many_arguments)]
@@ -792,6 +821,7 @@ impl VcpInhibitionTask {
     context: &TaskContext,
     state: &VcpSetup,
     gaze: (i32, i32),
+    trial_type: TrialType,
     abort_state: State,
     abort_pulse_ms: u64,
     monitorsubj_w_pix: i32,
@@ -816,9 +846,11 @@ impl VcpInhibitionTask {
 
     context.play_sound(state.abort_sound.clone());
 
-    state
-      .trial_saccade_abort_count
-      .fetch_add(1, Ordering::Relaxed);
+    match trial_type {
+      TrialType::Saccade => &state.trial_saccade_abort_count,
+      TrialType::Catch => &state.trial_catch_abort_count,
+    }
+    .fetch_add(1, Ordering::Relaxed);
     context
       .log(&format!(
         "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
@@ -1072,8 +1104,9 @@ impl VcpInhibitionTask {
   /// Ported from `handle_go_cue_reaction` (lines 552-575): sets state to
   /// `GoCue`, logs it, then waits — via `wait_for_hold`, tolerating one
   /// blink — for the gaze to hold within `go_cue_radius_pix` of `center`
-  /// for a fixed 80ms, succeeding regardless of the hold's own result if
-  /// those 80ms actually elapsed (Python: `if time.perf_counter() - now >
+  /// for `go_cue_duration` (config key `go_cue_duration`, 80ms in the
+  /// Python source), succeeding regardless of the hold's own result if
+  /// that duration actually elapsed (Python: `if time.perf_counter() - now >
   /// duration_s: success = True`), then logs the post-reaction gaze in
   /// pixels/degrees. Returns whether the check succeeded.
   #[allow(clippy::too_many_arguments)]
@@ -1084,6 +1117,7 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     go_cue_radius_pix: f64,
+    go_cue_duration: Duration,
     blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
@@ -1093,7 +1127,6 @@ impl VcpInhibitionTask {
     context.log("BehavState=GO_CUE").await;
     println!("{:?}", State::GoCue);
 
-    const DURATION: Duration = Duration::from_millis(80);
     let now = Instant::now();
     let mut success = self
       .wait_for_hold(
@@ -1102,12 +1135,12 @@ impl VcpInhibitionTask {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < go_cue_radius_pix
         }),
-        DURATION,
+        go_cue_duration,
         Some(Duration::ZERO),
         false,
       )
       .await;
-    //if now.elapsed() > DURATION {
+    //if now.elapsed() > go_cue_duration {
     //  success = true;
     //}
 
@@ -1158,14 +1191,14 @@ impl VcpInhibitionTask {
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
-  ) -> bool {
+  ) -> (bool, Duration) {
     *self.state.lock().unwrap() = Some(State::AcquireTarget);
     context.log("BehavState=ACQUIRE_TARGET").await;
     println!("{:?}", State::AcquireTarget);
 
-    let success = match trial_type {
+    let (success, elapsed) = match trial_type {
       TrialType::Catch => {
-        self
+        let ok = self
           .wait_for_hold(
             context,
             gaze_condition(gaze_queue, last_gaze, |point| {
@@ -1176,10 +1209,12 @@ impl VcpInhibitionTask {
             Some(blink_duration),
             false,
           )
-          .await
+          .await;
+        (ok, Duration::ZERO)
       }
       TrialType::Saccade => {
-        self
+        let acq_start = Instant::now();
+        let ok = self
           .wait_for(
             context,
             gaze_condition(gaze_queue, last_gaze, |point| {
@@ -1188,7 +1223,8 @@ impl VcpInhibitionTask {
             }),
             Some(decision_timeout),
           )
-          .await
+          .await;
+        (ok, acq_start.elapsed())
       }
     };
 
@@ -1208,7 +1244,7 @@ impl VcpInhibitionTask {
       ))
       .await;
 
-    success
+    (success, elapsed)
   }
 
   /// Ported from `handle_hold_target`/`hold_target_func` (lines 608-633,
@@ -1402,6 +1438,8 @@ impl BehaviorTask for VcpInhibitionTask {
         trial_saccade_failure_count: AtomicU64::new(0),
         trial_catch_count: AtomicU64::new(0),
         trial_catch_success_count: AtomicU64::new(0),
+        trial_catch_abort_count: AtomicU64::new(0),
+        trial_catch_failure_count: AtomicU64::new(0),
         consecutive_non_success: AtomicU64::new(0),
         background_color_qt: Color4f::new(
           background_color.0 as f32 / 255.0,
@@ -1470,6 +1508,13 @@ impl BehaviorTask for VcpInhibitionTask {
           let targetpos_pix = (x as i32, y as i32);
           let targetpos_pix_f = (targetpos_pix.0 as f64, targetpos_pix.1 as f64);
           println!("Current target position (pix): {targetpos_pix:?}");
+          let dx = x - state.center_f.0;
+          let dy = state.center_f.1 - y;
+          let angle_deg = dy.atan2(dx).to_degrees();
+          let eccentricity_deg = (dx * dx + dy * dy).sqrt() * state.converter.deg_per_pixel;
+          println!(
+            "Current target position (deg): angle={angle_deg:.1}, eccentricity={eccentricity_deg:.1}"
+          );
           target_positions.rand_pos_i += 1;
           (targetpos_pix, targetpos_pix_f)
         }
@@ -1488,6 +1533,26 @@ impl BehaviorTask for VcpInhibitionTask {
         .log(&format!(
           "trial_summary_data.used_values targetposY_pix={}",
           targetpos_pix.1
+        ))
+        .await;
+
+      // Recovers the polar angle/eccentricity this position in `rand_pos` was
+      // originally generated from (`compute_target_positions` only keeps the
+      // resulting (x, y) pixel pairs, not the angle/radius that produced
+      // them), by inverting its `center_f + radius * (cos(angle), -sin(angle))`
+      // formula.
+      let dx = targetpos_pix_f.0 - state.center_f.0;
+      let dy = state.center_f.1 - targetpos_pix_f.1;
+      let targetpos_deg = dy.atan2(dx).to_degrees();
+      let targetpos_ecc = (dx * dx + dy * dy).sqrt() * state.converter.deg_per_pixel;
+      context
+        .log(&format!(
+          "trial_summary_data.used_values targetpos_deg={targetpos_deg}"
+        ))
+        .await;
+      context
+        .log(&format!(
+          "trial_summary_data.used_values targetpos_ecc={targetpos_ecc}"
         ))
         .await;
     }
@@ -1523,13 +1588,25 @@ impl BehaviorTask for VcpInhibitionTask {
     let accpt_fix_radius_deg = get_f64(config, "accpt_fix_radius_deg");
     let accpt_fix_radius_pix = state.converter.deg_to_pixel_rel(accpt_fix_radius_deg);
     
-    let accpt_gaze_radius_deg = if trial_type == TrialType::Catch {
-      get_f64(config, "accpt_catch_gaze_radius_deg")
+    let accpt_gaze_radius_pix = if trial_type == TrialType::Catch {
+      let r_deg = get_f64(config, "accpt_catch_gaze_radius_deg");
+      state.converter.deg_to_pixel_rel(r_deg)
     } else {
-      get_f64(config, "accpt_saccade_gaze_radius_deg")
+      let acct_gaze_radius_deg = get_f64(config, "accpt_saccade_gaze_radius_deg");
+      let gaze_radius_gain = get_f64(config, "gaze_radius_gain");
+      let ecc_pix = f64::hypot(
+        targetpos_pix.0 as f64 - state.center.0 as f64,
+        targetpos_pix.1 as f64 - state.center.1 as f64,
+      );
+      let ecc_deg = ecc_pix * state.converter.deg_per_pixel;
+      let r_deg = gaze_radius_gain * ecc_deg + acct_gaze_radius_deg;
+      // let r_deg = gaze_radius_gain * ecc_deg;
+      context.log(&format!(
+        "trial_summary_data.used_values accpt_gaze_radius_pix={:.1} ecc_deg={:.2} gaze_radius_gain={:.3}",
+        state.converter.deg_to_pixel_rel(r_deg), ecc_deg, gaze_radius_gain
+      )).await;
+      state.converter.deg_to_pixel_rel(r_deg)
     };
-    // let accpt_gaze_radius_deg = get_f64(config, "accpt_gaze_radius_deg");
-    let accpt_gaze_radius_pix = state.converter.deg_to_pixel_rel(accpt_gaze_radius_deg);
     let is_height_locked = get_bool(config, "is_height_locked");
     let paint_all_targets = get_bool(config, "paint_all_targets");
     let hide_during_hold = get_bool(config, "hide_during_hold");
@@ -1548,6 +1625,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
     let decision_timeout = get_value(config, &context, "decision_timeout").await / 1000.0;
     let start_duration = get_f64(config, "start_duration") / 1000.0;
+    let go_cue_duration = get_f64(config, "go_cue_duration") / 1000.0;
     let fix_duration = get_value(config, &context, "fix_duration").await / 1000.0;
     let del_duration = get_value(config, &context, "del_duration").await / 1000.0;
     let present_target_duration =
@@ -1621,7 +1699,7 @@ impl BehaviorTask for VcpInhibitionTask {
       background_color_qt,
       width_targ_pix as f32 / 2.0,
       3.0,
-      255.0,
+      target_color_rgb,
       100.0,
     );
     println!(
@@ -1633,7 +1711,6 @@ impl BehaviorTask for VcpInhibitionTask {
 
     let _ = (
       paint_all_targets,
-      target_color_rgb,
       decision_timeout,
       hold_target_duration,
       penalty_delay,
@@ -1783,6 +1860,7 @@ impl BehaviorTask for VcpInhibitionTask {
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortFixation,
           50,
           monitorsubj_w_pix as i32,
@@ -1826,6 +1904,7 @@ impl BehaviorTask for VcpInhibitionTask {
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortTarget,
           150,
           monitorsubj_w_pix as i32,
@@ -1867,6 +1946,7 @@ impl BehaviorTask for VcpInhibitionTask {
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortDelay,
           300,
           monitorsubj_w_pix as i32,
@@ -1899,6 +1979,7 @@ impl BehaviorTask for VcpInhibitionTask {
         &last_gaze,
         state.center,
         go_cue_radius_pix,
+        Duration::from_secs_f64(go_cue_duration),
         Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
@@ -1917,6 +1998,7 @@ impl BehaviorTask for VcpInhibitionTask {
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortDelay,
           300,
           monitorsubj_w_pix as i32,
@@ -1938,7 +2020,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
     // Ported from lines 1364-1370: waits for target acquisition (saccade
     // trials) or continued center fixation (catch trials).
-    let acquire_target_success = self
+    let (acquire_target_success, acquire_elapsed) = self
       .handle_acquire_target(
         &context,
         &gaze_queue,
@@ -1982,9 +2064,11 @@ impl BehaviorTask for VcpInhibitionTask {
       println!("{:?}", State::FailureSaccade);
       context.inject_analog("state_in", state_in_pulse(450)).await;
 
-      state
-        .trial_saccade_failure_count
-        .fetch_add(1, Ordering::Relaxed);
+      match trial_type {
+        TrialType::Saccade => &state.trial_saccade_failure_count,
+        TrialType::Catch => &state.trial_catch_failure_count,
+      }
+      .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
@@ -2046,7 +2130,7 @@ impl BehaviorTask for VcpInhibitionTask {
         accpt_gaze_radius_pix,
         Duration::from_secs_f64(hold_target_duration),
         Duration::from_secs_f64(blink_duration),
-        Duration::from_secs_f64(decision_timeout),
+        Duration::from_secs_f64(decision_timeout).saturating_sub(acquire_elapsed),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
@@ -2074,9 +2158,11 @@ impl BehaviorTask for VcpInhibitionTask {
       *self.state.lock().unwrap() = Some(State::FailureHold);
       println!("{:?}", State::FailureHold);
 
-      state
-        .trial_saccade_failure_count
-        .fetch_add(1, Ordering::Relaxed);
+      match trial_type {
+        TrialType::Saccade => &state.trial_saccade_failure_count,
+        TrialType::Catch => &state.trial_catch_failure_count,
+      }
+      .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
