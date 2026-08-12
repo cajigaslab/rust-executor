@@ -264,11 +264,11 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\success_clip.wav").unwrap();
+      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/success_clip.wav").unwrap();
     let abort_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\failure_clip.wav").unwrap();
+      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/failure_clip.wav").unwrap();
     let failure_sound =
-      StaticSoundData::from_file(r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav").unwrap();
+      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/timeout_failure.wav").unwrap();
 
     Vcp2AfcTask {
       inner: parking_lot::Mutex::new(Inner {
@@ -342,7 +342,7 @@ fn angle_in_sector(angle: i32, sector_min: i32, sector_max: i32) -> bool {
 
 fn get_valid_angles(step: i32, sector1_min: i32, sector1_max: i32) -> Vec<i32> {
   let ustep: usize = step.try_into().unwrap();
-  let mut angles:Vec<i32> = (0..360).step_by(ustep+1)
+  let mut angles:Vec<i32> = ndarray::linspace(0.0, 360.0, ustep+1).map(|f| f as i32)
   .filter(|angle| angle_in_sector(*angle, sector1_min, sector1_max))
   .collect();
 
@@ -939,6 +939,7 @@ impl BehaviorTask for Vcp2AfcTask {
     canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(background_color, None));
     let canvas_size = canvas.base_layer_size();
     let canvas_center = (canvas_size.width/2, canvas_size.height/2);
+    let sample_from_center = (sample_pos_pix.0 - canvas_center.0, sample_pos_pix.1 - canvas_center.1);
     canvas.draw_rect(Rect::from_xywh(0.0, 0.0, 4000.0, 4000.0), &Paint::new(background_color, None));
 
     let mut current_photodiode_static_square = PHOTODIODE_STATIC_SQUARE;
@@ -980,7 +981,7 @@ impl BehaviorTask for Vcp2AfcTask {
         if task_group == "Shapes" {
           pen.set_color4f(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
           canvas.save();
-          canvas.translate(sample_pos_pix);
+          canvas.translate(sample_from_center);
           match sample_shape.as_str() {
             "triangle" => {
               canvas.draw_path(&triangle, &pen);
@@ -988,7 +989,7 @@ impl BehaviorTask for Vcp2AfcTask {
             "circle" => {
               canvas.draw_path(&circle, &pen);
             }
-            "squaure" => {
+            "square" => {
               canvas.draw_path(&square, &pen);
             }
             _ => {}
@@ -1027,7 +1028,7 @@ impl BehaviorTask for Vcp2AfcTask {
               Some("circle") => {
                 canvas.draw_path(&circle, &pen);
               }
-              Some("squaure") => {
+              Some("square") => {
                 canvas.draw_path(&square, &pen);
               }
               _ => {}
@@ -1055,7 +1056,7 @@ impl BehaviorTask for Vcp2AfcTask {
               Some("circle") => {
                 canvas.draw_path(&circle, &pen);
               }
-              Some("squaure") => {
+              Some("square") => {
                 canvas.draw_path(&square, &pen);
               }
               _ => {}
@@ -1072,8 +1073,8 @@ impl BehaviorTask for Vcp2AfcTask {
 
     canvas.draw_rect(
       Rect::from_xywh(
-        canvas_size.width as f32 - 50.0,
-        canvas_size.height as f32 - 50.0,
+        canvas_size.width as f32 - 150.0,
+        canvas_size.height as f32 - 150.0,
         500.0,
         500.0,
       ),
