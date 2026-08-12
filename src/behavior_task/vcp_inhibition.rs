@@ -667,7 +667,7 @@ struct TrialState {
   stats: TrialStats,
   show_target: bool,
   luminance_targ_per: f64,
-  hide_during_hold: bool
+  hide_during_delay: bool
 }
 
 /// Trial-level counters/rates, computed once early in `run` (ported lines
@@ -1609,7 +1609,7 @@ impl BehaviorTask for VcpInhibitionTask {
     };
     let is_height_locked = get_bool(config, "is_height_locked");
     let paint_all_targets = get_bool(config, "paint_all_targets");
-    let hide_during_hold = get_bool(config, "hide_during_hold");
+    let hide_during_delay = get_bool(config, "hide_during_delay");
     let target_color_rgb = get_rgb(config, "target_color");
     let background_color = get_rgb(config, "background_color");
     let background_color_qt = Color4f::new(
@@ -1785,7 +1785,7 @@ impl BehaviorTask for VcpInhibitionTask {
       stats: trial_stats,
       show_target: false,
       luminance_targ_per,
-      hide_during_hold
+      hide_during_delay
     });
 
     match trial_type {
@@ -2335,7 +2335,7 @@ impl BehaviorTask for VcpInhibitionTask {
       stats,
       show_target,
       luminance_targ_per,
-      hide_during_hold,
+      hide_during_delay,
     )) = self.trial.lock().unwrap().as_ref().map(|t| {
       (
         t.background_color_qt,
@@ -2348,7 +2348,7 @@ impl BehaviorTask for VcpInhibitionTask {
         t.stats,
         t.show_target,
         t.luminance_targ_per,
-        t.hide_during_hold,
+        t.hide_during_delay,
       )
     })
     else {
@@ -2390,6 +2390,20 @@ impl BehaviorTask for VcpInhibitionTask {
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
       }
+      State::PresentTarget => {
+        current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
+        let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(2.0);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+        if trial_type == TrialType::Saccade {
+          // `draw_gaussian_target` (built with a fixed luminance of 100)
+          // isn't ported; `draw_gaussian` (built from this trial's actual
+          // `luminance_targ_per`) stands in for it.
+          self.draw_gaussian(canvas, 1.0);
+        }
+      }
       State::Delay => {
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
@@ -2397,7 +2411,11 @@ impl BehaviorTask for VcpInhibitionTask {
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
         if trial_type == TrialType::Saccade {
-          self.draw_gaussian(canvas, off_luminance);
+          if current_state == State::Delay {
+            if !hide_during_delay {
+              self.draw_gaussian(canvas, off_luminance);
+            }
+          }
         }
       }
       State::GoCue => {
@@ -2413,20 +2431,6 @@ impl BehaviorTask for VcpInhibitionTask {
           self.draw_gaussian(canvas, off_luminance);
         }
       }
-      State::PresentTarget => {
-        current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
-        let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
-        pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
-        pen.set_anti_alias(true);
-        canvas.draw_path(&cross, &pen);
-        if trial_type == TrialType::Saccade {
-          // `draw_gaussian_target` (built with a fixed luminance of 100)
-          // isn't ported; `draw_gaussian` (built from this trial's actual
-          // `luminance_targ_per`) stands in for it.
-          self.draw_gaussian(canvas, 1.0);
-        }
-      }
       State::HoldTarget | State::AcquireTarget => {
         if trial_type == TrialType::Catch {
           let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
@@ -2435,14 +2439,8 @@ impl BehaviorTask for VcpInhibitionTask {
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         } 
-        else {
-          if current_state == State::HoldTarget {
-            if !hide_during_hold {
-              self.draw_gaussian(canvas, off_luminance);
-            }
-          } else {
-            self.draw_gaussian(canvas, off_luminance);
-          }
+        if trial_type == TrialType::Saccade {
+          self.draw_gaussian(canvas, off_luminance);
         }
       }
       State::FailureSaccade => {
