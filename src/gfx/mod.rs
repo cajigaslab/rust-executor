@@ -12,7 +12,7 @@ use imgui_rs_vulkan_renderer::vulkan::{
 };
 use imgui_rs_vulkan_renderer::{Options, Renderer};
 use imgui_winit_support::WinitPlatform;
-use skia_safe::{Color4f, Picture, PictureRecorder, Rect};
+use skia_safe::Color4f;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -22,7 +22,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
-use crate::behavior_task::{SharedTask, TaskContext, Window};
+use crate::behavior_task::{BehaviorTask, SharedTask, TaskContext, Window};
 use crate::eye_tracking::SharedGazePath;
 use crate::task_controller::SharedTrialCounter;
 use crate::touch_screen::{SharedTouchPath, SharedWindowPosition, SharedWindowSize};
@@ -107,7 +107,6 @@ impl FpsCounter {
 pub fn run(
   current_task: SharedTask,
   context: Arc<TaskContext>,
-  tokio_handle: tokio::runtime::Handle,
   window_position: SharedWindowPosition,
   window_size: SharedWindowSize,
   touch_path: SharedTouchPath,
@@ -121,7 +120,6 @@ pub fn run(
     graphics: None,
     current_task,
     context,
-    tokio_handle,
     window_position,
     window_size,
     touch_path,
@@ -189,7 +187,6 @@ struct App {
   graphics: Option<Graphics>,
   current_task: SharedTask,
   context: Arc<TaskContext>,
-  tokio_handle: tokio::runtime::Handle,
   window_position: SharedWindowPosition,
   window_size: SharedWindowSize,
   touch_path: SharedTouchPath,
@@ -208,7 +205,7 @@ struct App {
   simulated_gaze_active: bool,
   /// The subject window's last known cursor position (physical, window-local
   /// pixels — the same space `CursorMoved` itself reports and
-  /// `TaskContext::push_gaze`/`gaze_path` expect), so a
+  /// `TaskContext::inject_gaze`/`gaze_path` expect), so a
   /// right-click-without-moving-first still has a position to forward
   /// immediately on press.
   last_cursor_pos: Option<(f64, f64)>,
@@ -229,15 +226,15 @@ impl App {
 }
 
 /// Forwards `(x, y)` as a gaze sample exactly like a real OCULOMATIC reading
-/// would (see `eye_tracking::run`): pushed to `context` (see
-/// `TaskContext::push_gaze`) and appended to `gaze_path` for the operator
-/// view's overlay. A free function (rather than an `App` method) so callers
-/// already holding a `&mut self.graphics` borrow — see `window_event` — can
-/// still call it, since it only needs `context`/`gaze_path`, not all of
-/// `self`.
-fn forward_simulated_gaze(context: &TaskContext, gaze_path: &SharedGazePath, x: i32, y: i32) {
-  context.push_gaze((x, y));
-  gaze_path.lock().unwrap().push((x, y));
+/// would: injected into `context` (see `TaskContext::inject_gaze`), which
+/// merges it into every `subscribe_to_gaze` feed — including
+/// `eye_tracking::run_overlay`'s, so it reaches `gaze_path` for the operator
+/// view's overlay the same way a real sample does, without this function
+/// needing to touch `gaze_path` itself. A free function (rather than an
+/// `App` method) so callers already holding a `&mut self.graphics` borrow —
+/// see `window_event` — can still call it, since it only needs `context`.
+fn forward_simulated_gaze(context: &TaskContext, x: i32, y: i32) {
+  context.inject_gaze((x as f64, y as f64));
 }
 
 impl ApplicationHandler for App {
@@ -353,12 +350,7 @@ impl ApplicationHandler for App {
       if due {
         if let Some((x, y)) = self.last_cursor_pos {
           self.last_simulated_gaze_at = Some(now);
-          forward_simulated_gaze(
-            &self.context,
-            &self.gaze_path,
-            x.round() as i32,
-            y.round() as i32,
-          );
+          forward_simulated_gaze(&self.context, x.round() as i32, y.round() as i32);
         }
       }
     }
@@ -388,7 +380,6 @@ impl ApplicationHandler for App {
     graphics.last_frame_at = Instant::now();
     if let Err(e) = graphics.render_frame(
       &self.current_task,
-      &self.tokio_handle,
       &self.touch_path,
       &self.gaze_path,
       &self.trial_counter,
@@ -611,7 +602,6 @@ impl Graphics {
   fn render_frame(
     &mut self,
     current_task: &SharedTask,
-    tokio_handle: &tokio::runtime::Handle,
     touch_path: &SharedTouchPath,
     gaze_path: &SharedGazePath,
     trial_counter: &SharedTrialCounter,
@@ -668,15 +658,14 @@ impl Graphics {
     };
     let trace_opacity = self.trace_opacity_percent / 100.0;
 
-    let (subject_picture, operator_picture) =
-      record_task_pictures(self.offscreen.extent, current_task, tokio_handle)?;
+    let task = current_task.lock().unwrap().clone();
 
     render_subject_frame(
       &self.base,
       &mut self.subject,
       &self.offscreen,
       &mut self.skia,
-      subject_picture,
+      task.as_ref(),
     )?;
 
     // Acquired here (rather than right before the render pass below, as
@@ -689,7 +678,7 @@ impl Graphics {
       &self.base,
       &self.operator_offscreen,
       &mut self.operator_skia,
-      operator_picture,
+      task.as_ref(),
       &self.dot_pipeline,
       &mut self.dot_target_operator,
       operator_frame_index,
@@ -846,49 +835,19 @@ fn image_subresource_range() -> vk::ImageSubresourceRange {
   }
 }
 
-/// Renders the current task (if any) for both views via `spawn_blocking`,
-/// recording each into a `Picture` rather than drawing on Skia's live canvas
-/// directly: a borrowed `&Canvas` tied to a frame's surface can't cross the
-/// `spawn_blocking` closure's `'static` boundary, but an owned `Picture` can
-/// (and is `Send`), so each is replayed onto the real canvas back on this
-/// thread afterwards (see `render_subject_frame`/`render_operator_offscreen`).
-/// Rendered in this order — subject phase, then operator phase — per
-/// [`crate::behavior_task::BehaviorTask`]'s two-phase contract. Both phases
-/// are recorded at the same `extent`: the subject and operator offscreen
-/// targets are always kept the same size (see
-/// `Graphics::resize_offscreen_targets_if_needed`), so `canvas.base_layer_size()`
-/// matches whichever target each phase is actually drawn into either way.
-fn record_task_pictures(
-  extent: vk::Extent2D,
-  current_task: &SharedTask,
-  tokio_handle: &tokio::runtime::Handle,
-) -> Result<(Option<Picture>, Option<Picture>)> {
-  let task = current_task.lock().unwrap().clone();
-  let (width, height) = (extent.width as f32, extent.height as f32);
-  let join = tokio_handle.spawn_blocking(move || {
-    let record = |window: Window| {
-      let mut recorder = PictureRecorder::new();
-      let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, width, height), false);
-      if let Some(task) = task.as_ref() {
-        task.render(canvas, window);
-      }
-      recorder.finish_recording_as_picture(None)
-    };
-    (record(Window::Subject), record(Window::Operator))
-  });
-  Ok(tokio_handle.block_on(join)?)
-}
-
-/// Draws the given (already-recorded subject-phase) picture into the subject
-/// offscreen target via Skia — overlaid with the touch path (red dots) and
-/// gaze path (blue dots), same as the operator view — and blits it into the
-/// subject window's swapchain image.
+/// Draws the current task (if any), for the subject phase, directly into the
+/// subject offscreen target via Skia — overlaid with the touch path (red
+/// dots) and gaze path (blue dots), same as the operator view — then blits it
+/// into the subject window's swapchain image. Drawn straight onto Skia's live
+/// canvas rather than recorded into a `Picture` and replayed: called in-place
+/// on the render thread, so there's no `'static`-boundary thread hop to work
+/// around (see `SkiaOffscreen::render`).
 fn render_subject_frame(
   base: &VulkanBase,
   subject: &mut SwapchainWindow,
   offscreen: &OffscreenTarget,
   skia: &mut SkiaOffscreen,
-  picture: Option<Picture>,
+  task: Option<&Arc<dyn BehaviorTask>>,
 ) -> Result<()> {
   let clear_color = Color4f::new(
     BLANK_CLEAR_COLOR[0],
@@ -898,8 +857,8 @@ fn render_subject_frame(
   );
 
   skia.render(clear_color, |canvas| {
-    if let Some(picture) = picture.as_ref() {
-      canvas.draw_picture(picture, None, None);
+    if let Some(task) = task {
+      task.render(canvas, Window::Subject);
     }
   });
   let layout_after_skia = skia.current_layout();
@@ -1017,7 +976,7 @@ fn render_subject_frame(
   subject.end_frame(base, frame.image_index)
 }
 
-/// Draws the given (already-recorded operator-phase) picture into the
+/// Draws the current task (if any), for the operator phase, directly into the
 /// operator offscreen target via Skia, then the touch path (red dots) and
 /// gaze path (blue dots) via `dot_pipeline` directly (bypassing Skia — see
 /// `dot_pipeline`'s doc comment for why), overlaid on top of it. Transitions
@@ -1032,7 +991,7 @@ fn render_operator_offscreen(
   base: &VulkanBase,
   offscreen: &OffscreenTarget,
   skia: &mut SkiaOffscreen,
-  picture: Option<Picture>,
+  task: Option<&Arc<dyn BehaviorTask>>,
   dot_pipeline: &DotPipeline,
   dot_target: &mut DotTarget,
   frame_index: usize,
@@ -1049,8 +1008,8 @@ fn render_operator_offscreen(
   );
 
   skia.render(clear_color, |canvas| {
-    if let Some(picture) = picture.as_ref() {
-      canvas.draw_picture(picture, None, None);
+    if let Some(task) = task {
+      task.render(canvas, Window::Operator);
     }
   });
   let layout_after_skia = skia.current_layout();

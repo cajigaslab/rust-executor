@@ -1,12 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tonic::transport::Channel;
 
-use crate::analog::last_span_value;
+use crate::analog::PointSubscription;
 use crate::behavior_task::TaskContext;
-use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
-use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
+use crate::pb::thalamus_grpc::NodeSelector;
 use crate::touch_screen::{PointRingBuffer, SharedWindowSize};
 
 const OCULOMATIC_NODE_TYPE: &str = "OCULOMATIC";
@@ -185,55 +183,62 @@ fn angular_scaling_process(x: f64, y: f64, pins: &[Pin], scale_default: f64) -> 
   (new_x, new_y)
 }
 
-/// Streams eye-tracking input from Thalamus's `analog` RPC for the
-/// OCULOMATIC node over `client` (shared with `touch_screen::run`, since both
-/// just hit the same service's `analog` RPC for different node types),
-/// converts each raw reading to window-local pixel coordinates via
-/// `angular_scaling_process` (the same algorithm as Thalamus's own
-/// `AngularScalingConfig.process`, which reports gaze relative to screen
-/// center) plus `window_size` (to locate that center in the subject window's
-/// current — possibly since-resized — size), appends it to `gaze_path` for
-/// the operator view's gaze overlay, and forwards it to `context` (see
-/// `TaskContext::push_gaze`), mirroring `touch_screen::run`.
-pub async fn run(
-  mut client: ThalamusClient<Channel>,
+/// Builds the gaze feed `TaskContext::subscribe_to_gaze` hands back once
+/// registered via `TaskContext::set_gaze_factory` (see `main::run_grpc`): a
+/// direct OCULOMATIC subscription (see `Connection::subscribe_points`,
+/// reached through `context.connect` so every caller shares the one
+/// underlying stream) whose points are converted to window-local pixel
+/// coordinates via `angular_scaling_process` (the same algorithm as
+/// Thalamus's own `AngularScalingConfig.process`, which reports gaze
+/// relative to screen center) plus `window_size` (to locate that center in
+/// the subject window's current — possibly since-resized — size).
+pub fn factory(
   angular_scaling: SharedAngularScaling,
-  gaze_path: SharedGazePath,
-  context: Arc<TaskContext>,
   window_size: SharedWindowSize,
-) -> anyhow::Result<()> {
-  let request = AnalogRequest {
-    node: Some(NodeSelector {
-      name: String::new(),
-      r#type: OCULOMATIC_NODE_TYPE.to_string(),
-    }),
-    channels: Vec::new(),
-    channel_names: Vec::new(),
-  };
-
-  tracing::info!("connecting to OCULOMATIC analog stream");
-  let response = client.analog(request).await?;
-  let mut inbound = response.into_inner();
-
-  while let Some(analog) = inbound.message().await? {
-    let (Some(x), Some(y)) = (last_span_value(&analog, "X"), last_span_value(&analog, "Y")) else {
-      // Either component is missing from this message: skip it.
-      continue;
-    };
-
-    // Thalamus flips Y before scaling (see `Canvas.on_ros_gaze`).
-    let (scaled_x, scaled_y) = {
-      let cache = angular_scaling.lock().unwrap();
-      angular_scaling_process(x, -y, &cache.pins, cache.scale_default)
-    };
-
-    let (window_width, window_height) = *window_size.lock().unwrap();
-    let local_x = (scaled_x + window_width as f64 / 2.0).round() as i32;
-    let local_y = (scaled_y + window_height as f64 / 2.0).round() as i32;
-
-    context.push_gaze((local_x, local_y));
-    gaze_path.lock().unwrap().push((local_x, local_y));
+) -> impl Fn(&TaskContext) -> Arc<PointSubscription> {
+  move |context: &TaskContext| {
+    let connection = context.connect(
+      NodeSelector {
+        name: String::new(),
+        r#type: OCULOMATIC_NODE_TYPE.to_string(),
+      },
+      vec!["X".to_string(), "Y".to_string()],
+    );
+    let angular_scaling = angular_scaling.clone();
+    let window_size = window_size.clone();
+    connection.subscribe_points(
+      "X",
+      "Y",
+      Some(move |x: f64, y: f64| {
+        // Thalamus flips Y before scaling (see `Canvas.on_ros_gaze`).
+        let (scaled_x, scaled_y) = {
+          let cache = angular_scaling.lock().unwrap();
+          angular_scaling_process(x, -y, &cache.pins, cache.scale_default)
+        };
+        let (window_width, window_height) = *window_size.lock().unwrap();
+        (
+          scaled_x + window_width as f64 / 2.0,
+          scaled_y + window_height as f64 / 2.0,
+        )
+      }),
+    )
   }
+}
 
-  Ok(())
+/// Drains `context`'s own gaze feed (`TaskContext::subscribe_to_gaze`,
+/// itself built from [`factory`], merged with anything injected via
+/// `TaskContext::inject_gaze` — e.g. gfx's mouse-simulated gaze) forever,
+/// feeding `gaze_path` for the operator view's gaze overlay.
+pub async fn run_overlay(context: Arc<TaskContext>, gaze_path: SharedGazePath) -> anyhow::Result<()> {
+  let subscription = context.subscribe_to_gaze();
+  loop {
+    let notified = subscription.notify().notified();
+    for (x, y) in subscription.drain() {
+      gaze_path
+        .lock()
+        .unwrap()
+        .push((x.round() as i32, y.round() as i32));
+    }
+    notified.await;
+  }
 }

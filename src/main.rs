@@ -40,10 +40,7 @@ fn main() -> anyhow::Result<()> {
 
   // The Thalamus/TaskController gRPC clients run on a background thread with
   // their own Tokio runtime; the windowing/Vulkan render loop below needs the
-  // main thread to itself on most platforms. The render loop invokes
-  // `BehaviorTask::render` via that runtime's `spawn_blocking` + `block_on`
-  // (see `gfx::render_subject_frame`), so the grpc thread sends a `Handle` to
-  // it back once it's built.
+  // main thread to itself on most platforms.
   let grpc_current_task = current_task.clone();
   let grpc_window_position = window_position.clone();
   let grpc_window_size = window_size.clone();
@@ -51,7 +48,6 @@ fn main() -> anyhow::Result<()> {
   let grpc_gaze_path = gaze_path.clone();
   let grpc_angular_scaling = angular_scaling.clone();
   let grpc_trial_counter = trial_counter.clone();
-  let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
   // Sent by `run_grpc` once the session-wide `TaskContext` it builds (see
   // its doc comment) is ready — shortly after the gRPC thread's Tokio
   // runtime starts, not immediately, since building it needs an async
@@ -68,7 +64,6 @@ fn main() -> anyhow::Result<()> {
           return;
         }
       };
-      let _ = handle_tx.send(runtime.handle().clone());
       if let Err(e) = runtime.block_on(run_grpc(
         addr,
         grpc_current_task,
@@ -84,9 +79,6 @@ fn main() -> anyhow::Result<()> {
       }
     })?;
 
-  let tokio_handle = handle_rx
-    .recv()
-    .map_err(|_| anyhow::anyhow!("grpc thread exited before it started its Tokio runtime"))?;
   let context = context_rx
     .recv()
     .map_err(|_| anyhow::anyhow!("grpc thread exited before it built a TaskContext"))?;
@@ -94,7 +86,6 @@ fn main() -> anyhow::Result<()> {
   gfx::run(
     current_task,
     context,
-    tokio_handle,
     window_position,
     window_size,
     touch_path,
@@ -124,16 +115,23 @@ async fn run_grpc(
 
   // A real Thalamus `TaskContext` is constructed once for the whole task
   // controller session and shared by every trial (`task_controller::run`)
-  // and by the touch/gaze analog streams below (`touch_screen::run`/
-  // `eye_tracking::run`, which push samples into it), rather than each
-  // opening its own. The sound manager is likewise opened once here and
-  // forwarded to it, rather than each `BehaviorTask` opening its own.
-  // `context_tx` hands it back to `main`, which needs the same instance for
-  // `gfx::run`.
+  // and by the touch/gaze feeds set up below (`touch_screen::factory`/
+  // `eye_tracking::factory`, registered via `set_touch_factory`/
+  // `set_gaze_factory`), rather than each opening its own. The sound
+  // manager is likewise opened once here and forwarded to it, rather than
+  // each `BehaviorTask` opening its own. `context_tx` hands it back to
+  // `main`, which needs the same instance for `gfx::run`.
   let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
     .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(analog_client.clone(), audio_manager));
+  let context = Arc::new(TaskContext::new(analog_client, audio_manager));
   let _ = context_tx.send(context.clone());
+
+  // TOUCH_SCREEN and OCULOMATIC both just hit the context's Thalamus
+  // client's `analog` RPC for different node types, reached through
+  // `TaskContext::connect`'s connection-sharing registry rather than each
+  // factory dialing its own.
+  context.set_touch_factory(touch_screen::factory(window_position));
+  context.set_gaze_factory(eye_tracking::factory(angular_scaling.clone(), window_size));
 
   let mut app_state = Value::Object(Default::default());
 
@@ -199,30 +197,16 @@ async fn run_grpc(
     }
   });
 
-  // TOUCH_SCREEN and OCULOMATIC both just hit `analog_client`'s service's
-  // `analog` RPC for different node types, so they share the one connection
-  // opened above rather than each dialing their own.
-  let touch_client = analog_client.clone();
-  let touch_context = context.clone();
+  let touch_overlay_context = context.clone();
   tokio::spawn(async move {
-    if let Err(e) = touch_screen::run(touch_client, touch_context, window_position, touch_path)
-      .await
-    {
-      tracing::error!("touch screen analog stream failed: {e}");
+    if let Err(e) = touch_screen::run_overlay(touch_overlay_context, touch_path).await {
+      tracing::error!("touch overlay forwarder failed: {e}");
     }
   });
-  let gaze_angular_scaling = angular_scaling.clone();
+  let gaze_overlay_context = context.clone();
   tokio::spawn(async move {
-    if let Err(e) = eye_tracking::run(
-      analog_client,
-      gaze_angular_scaling,
-      gaze_path,
-      context,
-      window_size,
-    )
-    .await
-    {
-      tracing::error!("eye tracking analog stream failed: {e}");
+    if let Err(e) = eye_tracking::run_overlay(gaze_overlay_context, gaze_path).await {
+      tracing::error!("gaze overlay forwarder failed: {e}");
     }
   });
 
