@@ -8,6 +8,7 @@ use crate::pb::thalamus_grpc::NodeSelector;
 use crate::touch_screen::{PointRingBuffer, SharedWindowSize};
 
 const OCULOMATIC_NODE_TYPE: &str = "OCULOMATIC";
+const ANGULAR_SCALING_NODE_TYPE: &str = "ANGULAR_SCALING";
 
 /// Gaze points received since the last periodic clear (see
 /// `gfx::Graphics::render_frame`, which clears it alongside the touch path),
@@ -222,6 +223,26 @@ pub fn factory(
         )
       }),
     )
+  }
+}
+
+/// Builds the gaze feed `TaskContext::subscribe_to_gaze` hands back when
+/// wired to Thalamus's `ANGULAR_SCALING` node instead — see `main::run_grpc`,
+/// which currently has this one registered with [`factory`] commented out.
+/// Unlike `factory`, `ANGULAR_SCALING` applies the scaling itself and
+/// reports absolute screen coordinates directly, so this needs no
+/// transform at all: no `angular_scaling_process` call, and no
+/// `window_size`-based recenter.
+pub fn factory_angular_scaling() -> impl Fn(&TaskContext) -> Arc<PointSubscription> {
+  move |context: &TaskContext| {
+    let connection = context.connect(
+      NodeSelector {
+        name: String::new(),
+        r#type: ANGULAR_SCALING_NODE_TYPE.to_string(),
+      },
+      vec!["X".to_string(), "Y".to_string()],
+    );
+    connection.subscribe_points("X", "Y", None::<fn(f64, f64) -> (f64, f64)>)
   }
 }
 

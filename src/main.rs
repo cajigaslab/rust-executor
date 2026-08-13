@@ -126,12 +126,16 @@ async fn run_grpc(
   let context = Arc::new(TaskContext::new(analog_client, audio_manager));
   let _ = context_tx.send(context.clone());
 
-  // TOUCH_SCREEN and OCULOMATIC both just hit the context's Thalamus
-  // client's `analog` RPC for different node types, reached through
-  // `TaskContext::connect`'s connection-sharing registry rather than each
-  // factory dialing its own.
+  // TOUCH_SCREEN and OCULOMATIC/ANGULAR_SCALING both just hit the context's
+  // Thalamus client's `analog` RPC for different node types, reached
+  // through `TaskContext::connect`'s connection-sharing registry rather
+  // than each factory dialing its own.
   context.set_touch_factory(touch_screen::factory(window_position));
-  context.set_gaze_factory(eye_tracking::factory(angular_scaling.clone(), window_size));
+  // OCULOMATIC + client-side angular scaling (see `eye_tracking::factory`).
+  // context.set_gaze_factory(eye_tracking::factory(angular_scaling.clone(), window_size));
+  // ANGULAR_SCALING node — applies the scaling itself, reports absolute
+  // screen coordinates (see `eye_tracking::factory_angular_scaling`).
+  context.set_gaze_factory(eye_tracking::factory_angular_scaling());
 
   let mut app_state = Value::Object(Default::default());
 
