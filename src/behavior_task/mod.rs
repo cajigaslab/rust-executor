@@ -93,16 +93,24 @@ pub fn shared_task() -> SharedTask {
   Arc::new(Mutex::new(None))
 }
 
+/// Ported from `wait_for` (util.py:357-366): waits — event-driven, waking
+/// on `notify` — until `condition` returns true or `timeout` elapses
+/// (waits indefinitely if `timeout` is `None`), then returns `condition`'s
+/// value at that point. `condition` is an opaque predicate — `wait_for`
+/// has no notion of gaze or touch itself; a condition that cares about
+/// gaze builds it via `gaze_condition` (see its doc comment) to consume a
+/// `GazeQueue` internally, and callers pass that same queue's
+/// `PointSubscription::notify()` here so a wakeup isn't missed.
 async fn wait_for(
-  context: &TaskContext,
+  notify: &tokio::sync::Notify,
   condition: impl Fn() -> bool,
   timeout: Option<Duration>,
 ) -> bool {
   let deadline = timeout.map(|d| Instant::now() + d);
   loop {
-    // Constructed before the check below, per `TaskContext::notify`'s doc
-    // comment, so a push racing with that check isn't missed.
-    let notified = context.notify().notified();
+    // Constructed before the check below, per `PointSubscription::notify`'s
+    // doc comment, so a push racing with that check isn't missed.
+    let notified = notify.notified();
     if condition() {
       return true;
     }
@@ -121,44 +129,59 @@ async fn wait_for(
   }
 }
 
-async fn wait_for_hold(
-  context: &TaskContext,
-  condition: impl Fn() -> bool,
-  hold_duration: Duration,
-  blink_duration: Option<Duration>,
-  blink_resets: bool,
-) -> bool {
-  let mut start = Instant::now();
-  let mut time_spent_blinking = Duration::ZERO;
+  /// Ported from `wait_for_hold` (util.py:469-504, `include_blink = False`):
+  /// waits for `condition` to hold continuously for `hold_duration`,
+  /// tolerating brief lapses ("blinks") of up to `blink_duration` each (time
+  /// spent blinking doesn't count against `hold_duration`) — a lapse not
+  /// reacquired within `blink_duration` fails the hold. `blink_duration =
+  /// None` (as Python's `fixate_func` passes) waits indefinitely to
+  /// reacquire, so a lapse can never fail the hold that way.
+  ///
+  /// `blink_resets` is a newer `wait_for_hold` parameter (from a different
+  /// machine's util.py than the one this port otherwise follows): when
+  /// true, reacquiring after a blink restarts `hold_duration` from zero
+  /// instead of just excluding the time spent blinking (`hold_target_func`'s
+  /// saccade-trial branch passes `true`; every other call site here keeps
+  /// the old behavior via `false`).
+  ///
+  /// Returns whether the hold succeeded.
+  async fn wait_for_hold(
+    notify: &tokio::sync::Notify,
+    condition: impl Fn() -> bool,
+    hold_duration: Duration,
+    blink_duration: Option<Duration>,
+    blink_resets: bool,
+  ) -> bool {
+    let mut start = Instant::now();
+    let mut time_spent_blinking = Duration::ZERO;
 
-  loop {
-    let Some(remaining) = (hold_duration + time_spent_blinking).checked_sub(start.elapsed())
-    else {
-      break;
-    };
+    loop {
+      let Some(remaining) = (hold_duration + time_spent_blinking).checked_sub(start.elapsed())
+      else {
+        break;
+      };
 
-    let blinked = 
-      wait_for(context, || !condition(), Some(remaining))
-      .await;
-    if !blinked {
-      break;
+      let blinked = wait_for(notify, || !condition(), Some(remaining))
+        .await;
+      if !blinked {
+        break;
+      }
+
+      //context.log("BehavState=blink").await;
+
+      let blink_start = Instant::now();
+      let reacquired = wait_for(notify, &condition, blink_duration).await;
+      if !reacquired {
+        return false;
+      }
+
+      if blink_resets {
+        start = Instant::now();
+        time_spent_blinking = Duration::ZERO;
+      } else {
+        time_spent_blinking += blink_start.elapsed();
+      }
     }
 
-    //context.log("BehavState=blink").await;
-
-    let blink_start = Instant::now();
-    let reacquired = wait_for(context, &condition, blink_duration).await;
-    if !reacquired {
-      return false;
-    }
-
-    if blink_resets {
-      start = Instant::now();
-      time_spent_blinking = Duration::ZERO;
-    } else {
-      time_spent_blinking += blink_start.elapsed();
-    }
+    true
   }
-
-  true
-}

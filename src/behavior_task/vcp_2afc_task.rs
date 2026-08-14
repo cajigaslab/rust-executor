@@ -368,14 +368,15 @@ fn get_valid_angles_loc(step_deg: i32, sector1_min: i32, sector1_max: i32, secto
 }
 
 fn point_condition<'a, 'b>(
-  point_queue: &'a PointSubscription,
+  gaze_queue: &'a Arc<PointSubscription>,
   last_point_mutex: impl Fn() -> parking_lot::MappedMutexGuard<'b, (i32, i32)> + 'a,
   within: impl Fn((i32, i32)) -> bool + 'a,
 ) -> impl Fn() -> bool + 'a {
   move || {
     let mut satisfied = false;
     let mut last_point = last_point_mutex();
-    for point in point_queue.drain() {
+    for (x, y) in gaze_queue.drain() {
+      let point = (x.round() as i32, y.round() as i32);
       *last_point = point;
       if within(point) {
         satisfied = true;
@@ -385,13 +386,12 @@ fn point_condition<'a, 'b>(
   }
 }
 
-async fn sleep<'a, 'b>(context: &TaskContext,
-                       gaze_queue: &'a PointSubscription,
+async fn sleep<'a, 'b>(gaze_queue: &'a Arc<PointSubscription>,
                        last_point_mutex: impl Fn() -> parking_lot::MappedMutexGuard<'b, (i32, i32)> + 'a,
                        duration: Duration) {
   wait_for(
-    &context,
-    point_condition(&gaze_queue, last_point_mutex, |_| { false }),
+    gaze_queue.notify(),
+    point_condition(gaze_queue, last_point_mutex, |_| { false }),
     Some(duration)).await;
 }
 
@@ -653,7 +653,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     self.set_state(&context, "BehavState=ACQUIRE_FIXATION_post-drawing", State::AcquireFixation).await;
     wait_for(
-      &context,
+      gaze_queue.notify(),
       point_condition(&gaze_queue, get_gaze, |point| {
         let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
         distance(valid_gaze, center) < accpt_fix_radius_pix
@@ -664,7 +664,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     self.set_state(&context, "BehavState=FIXATE_post-drawing", State::Fixate).await;
     wait_for_hold(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
@@ -685,7 +685,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     self.set_state(&context, "BehavState=SAMPLE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::SamplePresentation).await;
     let present_success = wait_for_hold(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
@@ -718,13 +718,13 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
+      sleep(&gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
     
     self.set_state(&context, "BehavState=DELAY", State::Delay).await;
     wait_for_hold(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
@@ -737,7 +737,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     self.set_state(&context, "BehavState=CHOICE_PRESENTATION_post-drawing_PHOTODIODE-SQUARE", State::ChoicePresentation).await;
     let choice_success = wait_for_hold(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_fix_radius_pix
@@ -761,7 +761,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
+      sleep(&gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
@@ -778,7 +778,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
     self.set_state(&context, "BehavState=ACQUIRE_CHOICE_start", State::AcquireChoice).await;
     let acquire_success = wait_for(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           for pos in &wrong_positions {
@@ -823,13 +823,13 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
+      sleep(&gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
     self.set_state(&context, "BehavState=HOLD_CHOICE_start", State::HoldChoice).await;
     let choice_success = wait_for_hold(
-        &context,
+        gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < accpt_gaze_radius_pix
@@ -857,7 +857,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
+      sleep(&gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
@@ -871,7 +871,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "TrialResult=SUCCESS", State::Success).await;
     context.play_sound(self.inner.lock().success_sound.clone());
     
-    sleep(&context, &gaze_queue, get_gaze, Duration::from_secs(1)).await;
+    sleep(&gaze_queue, get_gaze, Duration::from_secs(1)).await;
     self.inner.lock().reward_total_released_ms += reward_per_trial as i32;
     context.log(&format!("starting_reward_release_of = {} ms, total_released = {} ms", self.inner.lock().reward_total_released_ms, reward_per_trial)).await;
 

@@ -43,7 +43,6 @@ fn main() -> anyhow::Result<()> {
   // main thread to itself on most platforms.
   let grpc_current_task = current_task.clone();
   let grpc_window_position = window_position.clone();
-  let grpc_window_size = window_size.clone();
   let grpc_touch_path = touch_path.clone();
   let grpc_gaze_path = gaze_path.clone();
   let grpc_angular_scaling = angular_scaling.clone();
@@ -69,7 +68,6 @@ fn main() -> anyhow::Result<()> {
         grpc_current_task,
         context_tx,
         grpc_window_position,
-        grpc_window_size,
         grpc_touch_path,
         grpc_gaze_path,
         grpc_angular_scaling,
@@ -99,7 +97,6 @@ async fn run_grpc(
   current_task: SharedTask,
   context_tx: std::sync::mpsc::SyncSender<Arc<TaskContext>>,
   window_position: touch_screen::SharedWindowPosition,
-  window_size: touch_screen::SharedWindowSize,
   touch_path: touch_screen::SharedTouchPath,
   gaze_path: eye_tracking::SharedGazePath,
   angular_scaling: eye_tracking::SharedAngularScaling,

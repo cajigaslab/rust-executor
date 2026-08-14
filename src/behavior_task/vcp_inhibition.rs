@@ -13,13 +13,12 @@ use skia_safe::gradient::{
 use skia_safe::{
   Canvas, Color4f, Font, FontMgr, Paint, PaintStyle, Path, PathBuilder, Rect, Shader, TileMode,
 };
-use tokio::sync::Notify;
 
 use crate::analog::PointSubscription;
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::{BehaviorTask, TaskContext, Window};
+use super::{BehaviorTask, TaskContext, Window, wait_for, wait_for_hold};
 
 const SUCCESS_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\success_clip.wav";
 const ABORT_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\failure_clip.wav";
@@ -711,102 +710,6 @@ impl VcpInhibitionTask {
     }
   }
 
-  /// Ported from `wait_for` (util.py:357-366): waits — event-driven, waking
-  /// on `notify` — until `condition` returns true or `timeout` elapses
-  /// (waits indefinitely if `timeout` is `None`), then returns `condition`'s
-  /// value at that point. `condition` is an opaque predicate — `wait_for`
-  /// has no notion of gaze or touch itself; a condition that cares about
-  /// gaze builds it via `gaze_condition` (see its doc comment) to consume a
-  /// `GazeQueue` internally, and callers pass that same queue's
-  /// `PointSubscription::notify()` here so a wakeup isn't missed.
-  async fn wait_for(
-    &self,
-    notify: &Notify,
-    condition: impl Fn() -> bool,
-    timeout: Option<Duration>,
-  ) -> bool {
-    let deadline = timeout.map(|d| Instant::now() + d);
-    loop {
-      // Constructed before the check below, per `PointSubscription::notify`'s
-      // doc comment, so a push racing with that check isn't missed.
-      let notified = notify.notified();
-      if condition() {
-        return true;
-      }
-      match deadline {
-        None => notified.await,
-        Some(deadline) => {
-          let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return condition();
-          };
-          tokio::select! {
-            _ = notified => {}
-            _ = tokio::time::sleep(remaining) => {}
-          }
-        }
-      }
-    }
-  }
-
-  /// Ported from `wait_for_hold` (util.py:469-504, `include_blink = False`):
-  /// waits for `condition` to hold continuously for `hold_duration`,
-  /// tolerating brief lapses ("blinks") of up to `blink_duration` each (time
-  /// spent blinking doesn't count against `hold_duration`) — a lapse not
-  /// reacquired within `blink_duration` fails the hold. `blink_duration =
-  /// None` (as Python's `fixate_func` passes) waits indefinitely to
-  /// reacquire, so a lapse can never fail the hold that way.
-  ///
-  /// `blink_resets` is a newer `wait_for_hold` parameter (from a different
-  /// machine's util.py than the one this port otherwise follows): when
-  /// true, reacquiring after a blink restarts `hold_duration` from zero
-  /// instead of just excluding the time spent blinking (`hold_target_func`'s
-  /// saccade-trial branch passes `true`; every other call site here keeps
-  /// the old behavior via `false`).
-  ///
-  /// Returns whether the hold succeeded.
-  async fn wait_for_hold(
-    &self,
-    notify: &Notify,
-    condition: impl Fn() -> bool,
-    hold_duration: Duration,
-    blink_duration: Option<Duration>,
-    blink_resets: bool,
-  ) -> bool {
-    let mut start = Instant::now();
-    let mut time_spent_blinking = Duration::ZERO;
-
-    loop {
-      let Some(remaining) = (hold_duration + time_spent_blinking).checked_sub(start.elapsed())
-      else {
-        break;
-      };
-
-      let blinked = self
-        .wait_for(notify, || !condition(), Some(remaining))
-        .await;
-      if !blinked {
-        break;
-      }
-
-      //context.log("BehavState=blink").await;
-
-      let blink_start = Instant::now();
-      let reacquired = self.wait_for(notify, &condition, blink_duration).await;
-      if !reacquired {
-        return false;
-      }
-
-      if blink_resets {
-        start = Instant::now();
-        time_spent_blinking = Duration::ZERO;
-      } else {
-        time_spent_blinking += blink_start.elapsed();
-      }
-    }
-
-    true
-  }
-
   /// Ported from the abort/failure block repeated after PRESENT_TARGET
   /// (lines 1272-1290) and DELAY (lines 1301-1321): records the failed
   /// gaze, logs the abort, plays `abort_sound`, bumps
@@ -906,8 +809,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=ACQUIRE_FIXATION").await;
     println!("{:?}", State::AcquireFixation);
 
-    self
-      .wait_for_hold(
+    wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -949,8 +851,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=PRESENT_TARGET").await;
     println!("{:?}", State::PresentTarget);
 
-    let success = self
-      .wait_for_hold(
+    let success = wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1005,8 +906,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=FIXATE").await;
     println!("{:?}", State::Fixate);
 
-    let success = self
-      .wait_for_hold(
+    let success = wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1060,8 +960,7 @@ impl VcpInhibitionTask {
     context.log("BehavState=DELAY").await;
     println!("{:?}", State::Delay);
 
-    let success = self
-      .wait_for_hold(
+    let success = wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1120,8 +1019,7 @@ impl VcpInhibitionTask {
     println!("{:?}", State::GoCue);
 
     const DURATION: Duration = Duration::from_millis(80);
-    let success = self
-      .wait_for_hold(
+    let success = wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1190,8 +1088,7 @@ impl VcpInhibitionTask {
 
     let success = match trial_type {
       TrialType::Catch => {
-        self
-          .wait_for_hold(
+        wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1204,8 +1101,7 @@ impl VcpInhibitionTask {
           .await
       }
       TrialType::Saccade => {
-        self
-          .wait_for(
+        wait_for(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1272,8 +1168,7 @@ impl VcpInhibitionTask {
 
     let success = match trial_type {
       TrialType::Catch => {
-        self
-          .wait_for_hold(
+        wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1286,8 +1181,7 @@ impl VcpInhibitionTask {
           .await
       }
       TrialType::Saccade => {
-        self
-          .wait_for_hold(
+        wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1366,12 +1260,6 @@ impl BehaviorTask for VcpInhibitionTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
     self.trial.lock().unwrap().take();
     self.state.lock().unwrap().take();
-    self.context.lock().unwrap().take();
-    
-    // Stashed so `render` — which isn't itself passed a `TaskContext` (see
-    // `BehaviorTask::render`'s doc comment) — can still show the latest
-    // gaze point in the operator view.
-    *self.context.lock().unwrap() = Some(context.clone());
 
     let config = &context.config();
     let monitorsubj_w_pix = get_i64(config, "monitorsubj_W_pix");

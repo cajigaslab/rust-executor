@@ -128,8 +128,10 @@ pub fn run(
     result: Ok(()),
     modifiers: ModifiersState::empty(),
     simulated_gaze_active: false,
+    simulated_touch_active: false,
     last_cursor_pos: None,
     last_simulated_gaze_at: None,
+    last_simulated_touch_at: None,
   };
   event_loop.run_app(&mut app)?;
   app.result
@@ -203,6 +205,7 @@ struct App {
   /// exercised — click and drag with the right mouse button — without real
   /// eye-tracking hardware.
   simulated_gaze_active: bool,
+  simulated_touch_active: bool,
   /// The subject window's last known cursor position (physical, window-local
   /// pixels — the same space `CursorMoved` itself reports and
   /// `TaskContext::inject_gaze`/`gaze_path` expect), so a
@@ -216,6 +219,7 @@ struct App {
   /// tracker samples. Reset to `None` between drags (button released), so a
   /// new drag's first sample always forwards immediately.
   last_simulated_gaze_at: Option<Instant>,
+  last_simulated_touch_at: Option<Instant>,
 }
 
 impl App {
@@ -235,6 +239,9 @@ impl App {
 /// see `window_event` — can still call it, since it only needs `context`.
 fn forward_simulated_gaze(context: &TaskContext, x: i32, y: i32) {
   context.inject_gaze((x as f64, y as f64));
+}
+fn forward_simulated_touch(context: &TaskContext, x: i32, y: i32) {
+  context.inject_touch((x as f64, y as f64));
 }
 
 impl ApplicationHandler for App {
@@ -298,15 +305,27 @@ impl ApplicationHandler for App {
 
       if let WindowEvent::MouseInput {
         state,
-        button: MouseButton::Right,
+        button,
         ..
       } = &event
       {
-        self.simulated_gaze_active = *state == ElementState::Pressed;
-        // Forces an immediate forward on the very next tick of
-        // `about_to_wait`'s continuous sampling below, rather than waiting
-        // out whatever's left of a stale interval from an earlier drag.
-        self.last_simulated_gaze_at = None;
+        match *button {
+          MouseButton::Right => {
+            self.simulated_gaze_active = *state == ElementState::Pressed;
+            // Forces an immediate forward on the very next tick of
+            // `about_to_wait`'s continuous sampling below, rather than waiting
+            // out whatever's left of a stale interval from an earlier drag.
+            self.last_simulated_gaze_at = None;
+          },
+          MouseButton::Left => {
+            self.simulated_touch_active = *state == ElementState::Pressed;
+            // Forces an immediate forward on the very next tick of
+            // `about_to_wait`'s continuous sampling below, rather than waiting
+            // out whatever's left of a stale interval from an earlier drag.
+            self.last_simulated_touch_at = None;
+          },
+          _ => {}
+        }
       }
 
       if let WindowEvent::KeyboardInput {
@@ -341,8 +360,8 @@ impl ApplicationHandler for App {
     // `CursorMoved` — a real eye tracker keeps sampling even when gaze isn't
     // moving. Independent of frame pacing below (120 Hz is well under even
     // the 1000 Hz frame cap), so this runs before that early-returns.
+    let now = Instant::now();
     if self.simulated_gaze_active {
-      let now = Instant::now();
       let due = match self.last_simulated_gaze_at {
         Some(at) => now.duration_since(at) >= SIMULATED_GAZE_INTERVAL,
         None => true,
@@ -351,6 +370,18 @@ impl ApplicationHandler for App {
         if let Some((x, y)) = self.last_cursor_pos {
           self.last_simulated_gaze_at = Some(now);
           forward_simulated_gaze(&self.context, x.round() as i32, y.round() as i32);
+        }
+      }
+    }
+    if self.simulated_touch_active {
+      let due = match self.last_simulated_touch_at {
+        Some(at) => now.duration_since(at) >= SIMULATED_GAZE_INTERVAL,
+        None => true,
+      };
+      if due {
+        if let Some((x, y)) = self.last_cursor_pos {
+          self.last_simulated_touch_at = Some(now);
+          forward_simulated_touch(&self.context, x.round() as i32, y.round() as i32);
         }
       }
     }

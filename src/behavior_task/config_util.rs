@@ -34,7 +34,7 @@ pub fn get_i64(value: &serde_json::Value) -> i64 {
       get_f64(value) as i64
     }
     serde_json::Value::Number(num) => {
-      num.as_i64().unwrap_or_else(|| num.as_f64().unwrap() as i64);
+      num.as_i64().unwrap_or_else(|| num.as_f64().unwrap() as i64)
     },
     _ => panic!("Number field must either be an object or number.")
   }
