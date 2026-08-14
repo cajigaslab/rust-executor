@@ -1,4 +1,5 @@
 use num_traits::{Float, FloatConst};
+use super::config_util::{get_i64};
 
 //pub fn rad_to_deg<F: Float + FloatConst>(rad: F) -> F {
 //  rad * F::from(180.0).unwrap() / F::PI()
@@ -27,8 +28,8 @@ impl Converter {
   }
 
   pub fn from_config(config: &serde_json::Value) -> Self {
-    let monitorsubj_w_pix: i32 = config["monitorsubj_W_pix"].as_i64().unwrap().try_into().unwrap();
-    let monitorsubj_h_pix: i32 = config["monitorsubj_H_pix"].as_i64().unwrap().try_into().unwrap();
+    let monitorsubj_w_pix: i32 = get_i64(&config["monitorsubj_W_pix"]) as i32;
+    let monitorsubj_h_pix: i32 = get_i64(&config["monitorsubj_H_pix"]) as i32;
     let monitorsubj_dist_m = config["monitorsubj_dist_m"].as_f64().unwrap();
     let monitorsubj_width_m = config["monitorsubj_width_m"].as_f64().unwrap();
     Converter::new(

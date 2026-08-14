@@ -34,6 +34,9 @@ parking_lot = "0.12.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[profile.dev]
+incremental = false
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 protox = "0.9"

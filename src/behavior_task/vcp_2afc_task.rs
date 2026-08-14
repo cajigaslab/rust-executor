@@ -8,7 +8,7 @@ use parking_lot;
 use async_trait::async_trait;
 use kira::sound::static_sound::StaticSoundData;
 use super::converter::{Converter, deg_to_rad};
-use super::config_util::{get_f64, get_color, get_f64_with_step};
+use super::config_util::{get_f64, get_i64, get_color, get_f64_with_step};
 use rand::seq::{IndexedRandom, SliceRandom};
 
 use crate::pb::task_controller_grpc::TaskResult;
@@ -385,6 +385,16 @@ fn point_condition<'a, 'b>(
   }
 }
 
+async fn sleep<'a, 'b>(context: &TaskContext,
+                       gaze_queue: &'a PointSubscription,
+                       last_point_mutex: impl Fn() -> parking_lot::MappedMutexGuard<'b, (i32, i32)> + 'a,
+                       duration: Duration) {
+  wait_for(
+    &context,
+    point_condition(&gaze_queue, last_point_mutex, |_| { false }),
+    Some(duration)).await;
+}
+
 fn gaussian_gradient_shader(
   background_color: Color4f,
   radius: f32,
@@ -470,8 +480,8 @@ impl BehaviorTask for Vcp2AfcTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
     let config = &context.config();
     let converter = Converter::from_config(config);
-    let monitorsubj_w_pix: i32 = config["monitorsubj_W_pix"].as_i64().unwrap().try_into().unwrap();
-    let monitorsubj_h_pix: i32 = config["monitorsubj_H_pix"].as_i64().unwrap().try_into().unwrap();
+    let monitorsubj_w_pix: i32 = get_i64(&config["monitorsubj_W_pix"]) as i32;
+    let monitorsubj_h_pix: i32 = get_i64(&config["monitorsubj_H_pix"]) as i32;
     let center = converter.center;
 
     let task_group = config["task_group"].as_str().unwrap();
@@ -708,7 +718,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      tokio::time::sleep(penalty_delay).await;
+      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
     
@@ -751,7 +761,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      tokio::time::sleep(penalty_delay).await;
+      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
@@ -813,7 +823,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      tokio::time::sleep(penalty_delay).await;
+      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
@@ -847,7 +857,7 @@ impl BehaviorTask for Vcp2AfcTask {
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
-      tokio::time::sleep(penalty_delay).await;
+      sleep(&context, &gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
 
@@ -861,7 +871,7 @@ impl BehaviorTask for Vcp2AfcTask {
     self.set_state(&context, "TrialResult=SUCCESS", State::Success).await;
     context.play_sound(self.inner.lock().success_sound.clone());
     
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(&context, &gaze_queue, get_gaze, Duration::from_secs(1)).await;
     self.inner.lock().reward_total_released_ms += reward_per_trial as i32;
     context.log(&format!("starting_reward_release_of = {} ms, total_released = {} ms", self.inner.lock().reward_total_released_ms, reward_per_trial)).await;
 
