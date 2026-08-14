@@ -205,7 +205,7 @@ struct App {
   simulated_gaze_active: bool,
   /// The subject window's last known cursor position (physical, window-local
   /// pixels — the same space `CursorMoved` itself reports and
-  /// `TaskContext::push_gaze`/`gaze_path` expect), so a
+  /// `TaskContext::inject_gaze`/`gaze_path` expect), so a
   /// right-click-without-moving-first still has a position to forward
   /// immediately on press.
   last_cursor_pos: Option<(f64, f64)>,
@@ -226,15 +226,15 @@ impl App {
 }
 
 /// Forwards `(x, y)` as a gaze sample exactly like a real OCULOMATIC reading
-/// would (see `eye_tracking::run`): pushed to `context` (see
-/// `TaskContext::push_gaze`) and appended to `gaze_path` for the operator
-/// view's overlay. A free function (rather than an `App` method) so callers
-/// already holding a `&mut self.graphics` borrow — see `window_event` — can
-/// still call it, since it only needs `context`/`gaze_path`, not all of
-/// `self`.
-fn forward_simulated_gaze(context: &TaskContext, gaze_path: &SharedGazePath, x: i32, y: i32) {
-  context.push_gaze((x, y));
-  gaze_path.lock().unwrap().push((x, y));
+/// would: injected into `context` (see `TaskContext::inject_gaze`), which
+/// merges it into every `subscribe_to_gaze` feed — including
+/// `eye_tracking::run_overlay`'s, so it reaches `gaze_path` for the operator
+/// view's overlay the same way a real sample does, without this function
+/// needing to touch `gaze_path` itself. A free function (rather than an
+/// `App` method) so callers already holding a `&mut self.graphics` borrow —
+/// see `window_event` — can still call it, since it only needs `context`.
+fn forward_simulated_gaze(context: &TaskContext, x: i32, y: i32) {
+  context.inject_gaze((x as f64, y as f64));
 }
 
 impl ApplicationHandler for App {
@@ -350,12 +350,7 @@ impl ApplicationHandler for App {
       if due {
         if let Some((x, y)) = self.last_cursor_pos {
           self.last_simulated_gaze_at = Some(now);
-          forward_simulated_gaze(
-            &self.context,
-            &self.gaze_path,
-            x.round() as i32,
-            y.round() as i32,
-          );
+          forward_simulated_gaze(&self.context, x.round() as i32, y.round() as i32);
         }
       }
     }

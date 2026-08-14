@@ -42,10 +42,11 @@ pub enum Window {
 /// two phases (e.g. operator-only overlays), and use
 /// `canvas.base_layer_size()` for the canvas's pixel dimensions. Touch and
 /// gaze input aren't pushed to task-side handlers — implementations that
-/// care about them read `context.touch()`/`context.gaze()` (the latest
-/// sample) or subscribe to every sample via
+/// care about them subscribe to every sample via
 /// `context.subscribe_to_touch()`/`context.subscribe_to_gaze()` (see
-/// `TaskContext`). `render` itself isn't passed the `TaskContext` `run` got
+/// `TaskContext`; it doesn't track a "latest" point itself, so a task that
+/// wants one keeps its own, e.g. the most recent point off its own
+/// subscription). `render` itself isn't passed the `TaskContext` `run` got
 /// — implementations that need it there (e.g. to show current gaze in the
 /// operator view) should stash the `Arc<TaskContext>` `run` receives in a
 /// field of their own and read it back from `render`. Implementations use

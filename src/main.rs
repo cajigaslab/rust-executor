@@ -115,16 +115,27 @@ async fn run_grpc(
 
   // A real Thalamus `TaskContext` is constructed once for the whole task
   // controller session and shared by every trial (`task_controller::run`)
-  // and by the touch/gaze analog streams below (`touch_screen::run`/
-  // `eye_tracking::run`, which push samples into it), rather than each
-  // opening its own. The sound manager is likewise opened once here and
-  // forwarded to it, rather than each `BehaviorTask` opening its own.
-  // `context_tx` hands it back to `main`, which needs the same instance for
-  // `gfx::run`.
+  // and by the touch/gaze feeds set up below (`touch_screen::factory`/
+  // `eye_tracking::factory`, registered via `set_touch_factory`/
+  // `set_gaze_factory`), rather than each opening its own. The sound
+  // manager is likewise opened once here and forwarded to it, rather than
+  // each `BehaviorTask` opening its own. `context_tx` hands it back to
+  // `main`, which needs the same instance for `gfx::run`.
   let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
     .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(analog_client.clone(), audio_manager));
+  let context = Arc::new(TaskContext::new(analog_client, audio_manager));
   let _ = context_tx.send(context.clone());
+
+  // TOUCH_SCREEN and OCULOMATIC/ANGULAR_SCALING both just hit the context's
+  // Thalamus client's `analog` RPC for different node types, reached
+  // through `TaskContext::connect`'s connection-sharing registry rather
+  // than each factory dialing its own.
+  context.set_touch_factory(touch_screen::factory(window_position));
+  // OCULOMATIC + client-side angular scaling (see `eye_tracking::factory`).
+  // context.set_gaze_factory(eye_tracking::factory(angular_scaling.clone(), window_size));
+  // ANGULAR_SCALING node — applies the scaling itself, reports absolute
+  // screen coordinates (see `eye_tracking::factory_angular_scaling`).
+  context.set_gaze_factory(eye_tracking::factory_angular_scaling());
 
   let mut app_state = Value::Object(Default::default());
 
@@ -190,30 +201,16 @@ async fn run_grpc(
     }
   });
 
-  // TOUCH_SCREEN and OCULOMATIC both just hit `analog_client`'s service's
-  // `analog` RPC for different node types, so they share the one connection
-  // opened above rather than each dialing their own.
-  let touch_client = analog_client.clone();
-  let touch_context = context.clone();
+  let touch_overlay_context = context.clone();
   tokio::spawn(async move {
-    if let Err(e) = touch_screen::run(touch_client, touch_context, window_position, touch_path)
-      .await
-    {
-      tracing::error!("touch screen analog stream failed: {e}");
+    if let Err(e) = touch_screen::run_overlay(touch_overlay_context, touch_path).await {
+      tracing::error!("touch overlay forwarder failed: {e}");
     }
   });
-  let gaze_angular_scaling = angular_scaling.clone();
+  let gaze_overlay_context = context.clone();
   tokio::spawn(async move {
-    if let Err(e) = eye_tracking::run(
-      analog_client,
-      gaze_angular_scaling,
-      gaze_path,
-      context,
-      window_size,
-    )
-    .await
-    {
-      tracing::error!("eye tracking analog stream failed: {e}");
+    if let Err(e) = eye_tracking::run_overlay(gaze_overlay_context, gaze_path).await {
+      tracing::error!("gaze overlay forwarder failed: {e}");
     }
   });
 
