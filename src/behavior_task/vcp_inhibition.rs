@@ -687,6 +687,7 @@ struct TrialState {
   shader: Shader,
   /// Ported from lines 842-853: the fixation cross path, in pixel space.
   cross: Path,
+  cross_line_width_pix: f64,
   off_opacity: f64,
   accpt_fix_radius_pix: f64,
   accpt_gaze_radius_pix: f64,
@@ -1611,6 +1612,9 @@ impl BehaviorTask for VcpInhibitionTask {
     cross_builder.line_to((vertices[3].0 as f32, vertices[3].1 as f32));
     let cross: Path = cross_builder.detach();
 
+    // Line width (pixels) of the fixation cross stroke drawn in `render`.
+    let cross_line_width_pix = get_f64(config, "cross_line_width_pix");
+
     // Ported from line 687 (before the one-time setup block, so read every
     // trial): controls the alpha of the fixation cross / catch-trial cue in
     // several `render` states.
@@ -1817,6 +1821,7 @@ impl BehaviorTask for VcpInhibitionTask {
       height_targ_pix,
       shader,
       cross,
+      cross_line_width_pix,
       off_opacity,
       accpt_fix_radius_pix,
       accpt_gaze_radius_pix,
@@ -2324,7 +2329,7 @@ impl BehaviorTask for VcpInhibitionTask {
     println!("{summary}");
 
     
-    tokio::time::sleep(std::time::Duration::from_secs_f64(0.35)).await;
+    tokio::time::sleep(std::time::Duration::from_secs_f64(0.5)).await;
 
     // Ported from lines 1448-1450: Python always returns `TaskResult(False)`
     // here, regardless of the trial's outcome — per its own comment, a
@@ -2370,6 +2375,7 @@ impl BehaviorTask for VcpInhibitionTask {
       accpt_fix_radius_pix,
       accpt_gaze_radius_pix,
       cross,
+      cross_line_width_pix,
       stats,
       show_target,
       luminance_targ_per,
@@ -2383,6 +2389,7 @@ impl BehaviorTask for VcpInhibitionTask {
         t.accpt_fix_radius_pix,
         t.accpt_gaze_radius_pix,
         t.cross.clone(),
+        t.cross_line_width_pix,
         t.stats,
         t.show_target,
         t.luminance_targ_per,
@@ -2430,7 +2437,7 @@ impl BehaviorTask for VcpInhibitionTask {
       State::AcquireFixation | State::Fixate => {
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
+        pen.set_stroke_width(cross_line_width_pix as f32);
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
       }
@@ -2438,7 +2445,7 @@ impl BehaviorTask for VcpInhibitionTask {
         current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
+        pen.set_stroke_width(cross_line_width_pix as f32);
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
         if trial_type == TrialType::Saccade {
@@ -2451,7 +2458,7 @@ impl BehaviorTask for VcpInhibitionTask {
       State::Delay => {
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
+        pen.set_stroke_width(cross_line_width_pix as f32);
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
         if trial_type == TrialType::Saccade {
@@ -2467,7 +2474,7 @@ impl BehaviorTask for VcpInhibitionTask {
         if trial_type == TrialType::Catch {
           let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
           pen.set_style(PaintStyle::Stroke);
-          pen.set_stroke_width(2.0);
+          pen.set_stroke_width(cross_line_width_pix as f32);
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         }
@@ -2479,7 +2486,7 @@ impl BehaviorTask for VcpInhibitionTask {
         if trial_type == TrialType::Catch {
           let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
           pen.set_style(PaintStyle::Stroke);
-          pen.set_stroke_width(2.0);
+          pen.set_stroke_width(cross_line_width_pix as f32);
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         } 
