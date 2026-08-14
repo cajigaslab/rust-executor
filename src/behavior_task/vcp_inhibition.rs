@@ -21,9 +21,9 @@ use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 use super::{BehaviorTask, TaskContext, Window};
 
-const SUCCESS_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\success_clip.wav";
-const ABORT_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\failure_clip.wav";
-const FAILURE_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\timeout_failure.wav";
+const SUCCESS_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\success_clip.wav";
+const ABORT_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\failure_clip.wav";
+const FAILURE_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav";
 
 /// This task's gaze feed — `TaskContext::subscribe_to_gaze`, the same feed
 /// `eye_tracking::run_overlay` and the operator overlay read, rather than a
