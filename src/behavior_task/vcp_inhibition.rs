@@ -735,6 +735,7 @@ pub struct VcpInhibitionTask {
   /// task (see its doc comment), so a trial's gaze subscription doesn't
   /// linger past that trial.
   screen_gaze_queue: Mutex<Option<GazeQueue>>,
+  last_gaze: Mutex<(i32, i32)>,
 }
 
 impl VcpInhibitionTask {
@@ -743,6 +744,7 @@ impl VcpInhibitionTask {
       trial: Mutex::new(None),
       state: Mutex::new(None),
       screen_gaze_queue: Mutex::new(None),
+      last_gaze: Mutex::new((99999, 99999)),
     }
   }
 
@@ -781,6 +783,15 @@ impl VcpInhibitionTask {
         }
       }
     }
+  }
+
+  async fn sleep<'a, 'b>(&self, gaze_queue: &'a Arc<PointSubscription>,
+                         last_gaze: &'a Mutex<(i32, i32)>,
+                         duration: Duration) {
+    self.wait_for(
+      gaze_queue.notify(),
+      gaze_condition(gaze_queue, last_gaze, |_| { false }),
+      Some(duration)).await;
   }
 
   /// Ported from `wait_for_hold` (util.py:469-504, `include_blink = False`):
@@ -854,6 +865,8 @@ impl VcpInhibitionTask {
   #[allow(clippy::too_many_arguments)]
   async fn abort_trial(
     &self,
+    gaze_queue: &Arc<PointSubscription>,
+    last_gaze: &Mutex<(i32, i32)>,
     context: &TaskContext,
     state: &VcpSetup,
     gaze: (i32, i32),
@@ -916,7 +929,7 @@ impl VcpInhibitionTask {
         ))
         .await;
     }
-    tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+    self.sleep(gaze_queue, last_gaze, Duration::from_secs_f64(penalty_delay + extra)).await;
     if extra > 0.0 {
       state.consecutive_non_success.store(0, Ordering::Relaxed);
     }
@@ -1525,7 +1538,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // `run`'s several return points below is taken — see
     // `GazeQueueGuard`'s doc comment.
     let _gaze_queue_guard = GazeQueueGuard(self);
-    let last_gaze = Mutex::new((99999, 99999));
+    *self.last_gaze.lock().unwrap() = (99999, 99999);
 
     let catch_trial_rate = get_f64(config, "catch_trial_rate");
     let trial_type = if rand::rng().random::<f64>() < catch_trial_rate {
@@ -1862,7 +1875,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_acquire_fixation(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(start_duration),
@@ -1884,7 +1897,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_fixate(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(fix_duration),
@@ -1897,9 +1910,11 @@ impl BehaviorTask for VcpInhibitionTask {
     context.inject_analog("state_in", state_in_pulse(20)).await;
 
     if !fixate_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
@@ -1923,7 +1938,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_present_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         accpt_gaze_radius_pix,
@@ -1941,9 +1956,11 @@ impl BehaviorTask for VcpInhibitionTask {
     // target presentation, aborts the trial — Python's `return
     // TaskResult(False)`.
     if !present_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
@@ -1967,7 +1984,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_delay(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(del_duration),
@@ -1983,9 +2000,11 @@ impl BehaviorTask for VcpInhibitionTask {
     // delay, aborts the trial (as above, but tagged ABORT_DELAY with a
     // 300ms pulse instead of ABORT_TARGET's 150ms).
     if !delay_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
@@ -2019,7 +2038,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_go_cue_reaction(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         go_cue_radius_pix,
         Duration::from_secs_f64(go_cue_duration),
@@ -2035,9 +2054,11 @@ impl BehaviorTask for VcpInhibitionTask {
     // (Python's `# await context.log('Duration=...')` there is commented
     // out, unlike DELAY's own) no duration log.
     if !go_cue_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
@@ -2067,7 +2088,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_acquire_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         trial_type,
         state.center,
         targetpos_pix,
@@ -2090,7 +2111,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // sleep in two around a `show_target` toggle (see `render`'s
     // `FailureSaccade` branch), so not reused via `abort_trial`.
     if !acquire_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       let valid_gaze = gaze_valid(
         gaze.0,
         gaze.1,
@@ -2146,9 +2167,9 @@ impl BehaviorTask for VcpInhibitionTask {
           .await;
       }
       self.trial.lock().unwrap().as_mut().unwrap().show_target = false;
-      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
       self.trial.lock().unwrap().as_mut().unwrap().show_target = true;
-      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
       if extra > 0.0 {
         state.consecutive_non_success.store(0, Ordering::Relaxed);
       }
@@ -2165,7 +2186,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_hold_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         trial_type,
         state.center,
         targetpos_pix,
@@ -2185,7 +2206,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // pulse and no split sleep this time (unlike FAILURE_SACCADE), doesn't
     // bump `trial_saccade_abort_count`.
     if !hold_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       let valid_gaze = gaze_valid(
         gaze.0,
         gaze.1,
@@ -2237,7 +2258,7 @@ impl BehaviorTask for VcpInhibitionTask {
           ))
           .await;
       }
-      tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64(penalty_delay + extra)).await;
       if extra > 0.0 {
         state.consecutive_non_success.store(0, Ordering::Relaxed);
       }
@@ -2252,7 +2273,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // `success_sound`, releases the reward pulse, bumps the
     // trial-type-appropriate success counter, and logs/prints the same
     // summary shape as the abort/failure branches above.
-    let gaze = *last_gaze.lock().unwrap();
+    let gaze = *self.last_gaze.lock().unwrap();
     let valid_gaze = gaze_valid(
       gaze.0,
       gaze.1,
@@ -2273,7 +2294,7 @@ impl BehaviorTask for VcpInhibitionTask {
     context.play_sound(state.success_sound.clone());
     // 1s delay to allow playing the sound; it doesn't play without this.
     // tokio::time::sleep(Duration::from_secs(1)).await;
-    tokio::time::sleep(std::time::Duration::from_secs_f64(reward_delay)).await;
+    self.sleep(&gaze_queue, &self.last_gaze, std::time::Duration::from_secs_f64(reward_delay)).await;
 
     let reward_total_released_ms = {
       let mut total = state.reward_total_released_ms.lock().unwrap();
@@ -2329,7 +2350,7 @@ impl BehaviorTask for VcpInhibitionTask {
     println!("{summary}");
 
     
-    tokio::time::sleep(std::time::Duration::from_secs_f64(0.5)).await;
+    self.sleep(&gaze_queue, &self.last_gaze, std::time::Duration::from_secs_f64(0.5)).await;
 
     // Ported from lines 1448-1450: Python always returns `TaskResult(False)`
     // here, regardless of the trial's outcome — per its own comment, a
@@ -2409,14 +2430,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // state machine still needs to see. `None` both before the first
     // trial's `run` has set `screen_gaze_queue` and after the current
     // trial's `run` has cleared it (see `GazeQueueGuard`).
-    let gaze = self
-      .screen_gaze_queue
-      .lock()
-      .unwrap()
-      .as_ref()
-      .and_then(|queue| queue.latest())
-      .map(|(x, y)| (x.round() as i32, y.round() as i32))
-      .unwrap_or((99999, 99999));
+    let gaze = self.last_gaze.lock().unwrap();
     let valid_gaze = gaze_valid(
       gaze.0,
       gaze.1,
