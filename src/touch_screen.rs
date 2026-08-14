@@ -1,11 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use tonic::transport::Channel;
-
-use crate::analog::last_span_value;
+use crate::analog::PointSubscription;
 use crate::behavior_task::TaskContext;
-use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
-use crate::pb::thalamus_grpc::{AnalogRequest, NodeSelector};
+use crate::pb::thalamus_grpc::NodeSelector;
 
 const TOUCH_SCREEN_NODE_TYPE: &str = "TOUCH_SCREEN";
 
@@ -21,9 +18,9 @@ pub fn shared_window_position() -> SharedWindowPosition {
 
 /// The subject window's current inner size, in physical pixels — kept up to
 /// date by `gfx::App::about_to_wait` (polled every frame, same as
-/// [`SharedWindowPosition`]). Used by `eye_tracking::run` (gaze reports are
-/// relative to screen center, so it needs the window's current size to find
-/// that center); `touch_screen::run` doesn't need it, since touch points are
+/// [`SharedWindowPosition`]). Used by `eye_tracking::factory` (gaze reports
+/// are relative to screen center, so it needs the window's current size to
+/// find that center); [`factory`] doesn't need it, since touch points are
 /// already in the same window-local physical-pixel space `BehaviorTask::render`
 /// draws into (the offscreen targets track the subject window's actual size —
 /// see `gfx::Graphics::resize_offscreen_targets_if_needed`).
@@ -87,46 +84,50 @@ pub fn shared_touch_path() -> SharedTouchPath {
   Arc::new(Mutex::new(PointRingBuffer::new()))
 }
 
-/// Streams touch input from Thalamus's `analog` RPC for the TOUCH_SCREEN node
-/// over `client` (shared with `eye_tracking::run`, since both just hit the
-/// same service's `analog` RPC for different node types) and forwards each
-/// touch point — translated from screen coordinates to window-local physical
-/// pixels (the same space `BehaviorTask::render` draws into — no further
-/// rescaling needed, see [`SharedWindowSize`]'s doc comment) — to `context`
-/// (see `TaskContext::push_touch`), as well as appending it to `touch_path`
-/// for the operator view's touch overlay.
-pub async fn run(
-  mut client: ThalamusClient<Channel>,
-  context: Arc<TaskContext>,
-  window_position: SharedWindowPosition,
-  touch_path: SharedTouchPath,
-) -> anyhow::Result<()> {
-  let request = AnalogRequest {
-    node: Some(NodeSelector {
-      name: String::new(),
-      r#type: TOUCH_SCREEN_NODE_TYPE.to_string(),
-    }),
-    channels: Vec::new(),
-    channel_names: Vec::new(),
-  };
-
-  tracing::info!("connecting to TOUCH_SCREEN analog stream");
-  let response = client.analog(request).await?;
-  let mut inbound = response.into_inner();
-
-  while let Some(analog) = inbound.message().await? {
-    let (Some(x), Some(y)) = (last_span_value(&analog, "X"), last_span_value(&analog, "Y")) else {
-      // Either component is missing from this message: skip it.
-      continue;
-    };
-
-    let (window_x, window_y) = *window_position.lock().unwrap();
-    let canvas_x = (x - window_x as f64).round() as i32;
-    let canvas_y = (y - window_y as f64).round() as i32;
-
-    context.push_touch((canvas_x, canvas_y));
-    touch_path.lock().unwrap().push((canvas_x, canvas_y));
+/// Builds the touch feed `TaskContext::subscribe_to_touch` hands back once
+/// registered via `TaskContext::set_touch_factory` (see `main::run_grpc`):
+/// a direct `TOUCH_SCREEN` subscription (see `Connection::subscribe_points`,
+/// reached through `context.connect` so every caller shares the one
+/// underlying stream) whose points are translated from screen coordinates
+/// to window-local physical pixels — the same space `BehaviorTask::render`
+/// draws into, so no further rescaling is needed (see [`SharedWindowSize`]'s
+/// doc comment, which explains why gaze needs the window size and touch
+/// doesn't).
+pub fn factory(window_position: SharedWindowPosition) -> impl Fn(&TaskContext) -> Arc<PointSubscription> {
+  move |context: &TaskContext| {
+    let connection = context.connect(
+      NodeSelector {
+        name: String::new(),
+        r#type: TOUCH_SCREEN_NODE_TYPE.to_string(),
+      },
+      vec!["X".to_string(), "Y".to_string()],
+    );
+    let window_position = window_position.clone();
+    connection.subscribe_points(
+      "X",
+      "Y",
+      Some(move |x: f64, y: f64| {
+        let (window_x, window_y) = *window_position.lock().unwrap();
+        (x - window_x as f64, y - window_y as f64)
+      }),
+    )
   }
+}
 
-  Ok(())
+/// Drains `context`'s own touch feed (`TaskContext::subscribe_to_touch`,
+/// itself built from [`factory`], merged with anything injected via
+/// `TaskContext::inject_touch`) forever, feeding `touch_path` for the
+/// operator view's touch overlay.
+pub async fn run_overlay(context: Arc<TaskContext>, touch_path: SharedTouchPath) -> anyhow::Result<()> {
+  let subscription = context.subscribe_to_touch();
+  loop {
+    let notified = subscription.notify().notified();
+    for (x, y) in subscription.drain() {
+      touch_path
+        .lock()
+        .unwrap()
+        .push((x.round() as i32, y.round() as i32));
+    }
+    notified.await;
+  }
 }
