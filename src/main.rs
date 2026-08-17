@@ -123,7 +123,7 @@ async fn run_grpc(
   // `main`, which needs the same instance for `gfx::run`.
   let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
     .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(analog_client, audio_manager));
+  let context = Arc::new(TaskContext::new(analog_client, audio_manager, window_size));
   let _ = context_tx.send(context.clone());
 
   // TOUCH_SCREEN and OCULOMATIC/ANGULAR_SCALING both just hit the context's

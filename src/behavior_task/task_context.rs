@@ -117,10 +117,11 @@ pub struct TaskContext {
   /// Live `analog` connections opened via [`Self::connect`], keyed by
   /// [`ConnectionKey`] and weakly held — see that method's doc comment.
   connections: Mutex<HashMap<ConnectionKey, Weak<Connection>>>,
+  _canvas_size: Arc<Mutex<(u32, u32)>>
 }
 
 impl TaskContext {
-  pub fn new(thalamus_client: ThalamusClient<Channel>, audio_manager: AudioManager) -> Self {
+  pub fn new(thalamus_client: ThalamusClient<Channel>, audio_manager: AudioManager, canvas_size: Arc<Mutex<(u32, u32)>>) -> Self {
     Self {
       config: Mutex::new(Value::Object(Default::default())),
       thalamus_client,
@@ -132,6 +133,7 @@ impl TaskContext {
       injected_touch: PointBroadcast::new(),
       injected_gaze: PointBroadcast::new(),
       connections: Mutex::new(HashMap::new()),
+      _canvas_size: canvas_size,
     }
   }
 
@@ -352,5 +354,9 @@ impl TaskContext {
         body: Some(inject_analog_request::Body::Signal(payload)),
       })
       .await;
+  }
+
+  pub fn canvas_size(&self) -> (u32, u32) {
+    *self._canvas_size.lock().unwrap()
   }
 }

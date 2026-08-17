@@ -1,6 +1,7 @@
 mod simple_arc;
 mod task_context;
 mod vcp_inhibition;
+mod json_task;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ use crate::pb::task_controller_grpc::TaskResult;
 pub use simple_arc::SimpleArcTask;
 pub use task_context::{PointSubscription, TaskContext};
 pub use vcp_inhibition::VcpInhibitionTask;
+pub use json_task::JsonTask;
 
 /// Which physical window a `render` call is currently producing pixels for.
 /// See [`BehaviorTask`] for how the render thread drives this each frame.
@@ -75,6 +77,10 @@ pub fn registry() -> HashMap<String, BehaviorTaskFactory> {
   map.insert(
     "VCP_inhibition_task".to_string(),
     (|| Arc::new(VcpInhibitionTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
+  );
+  map.insert(
+    "json_task".to_string(),
+    (|| Arc::new(JsonTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
   );
   map
 }
