@@ -80,7 +80,7 @@ pub fn registry() -> HashMap<String, BehaviorTaskFactory> {
   );
   map.insert(
     "json_task".to_string(),
-    (|| Arc::new(JsonTask::new()) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
+    (|| Arc::new(JsonTask::new(json_task::BASIC_DECL_TASK)) as Arc<dyn BehaviorTask>) as BehaviorTaskFactory,
   );
   map
 }

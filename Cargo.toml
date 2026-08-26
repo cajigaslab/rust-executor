@@ -26,6 +26,8 @@ async-trait = "0.1"
 kira = "0.12.1"
 rand = "0.10.2"
 naga = { version = "26", features = ["wgsl-in", "spv-out"] }
+serde = { version = "1.0.229", features = ["derive"] }
+meval = { version = "0.2.0", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
