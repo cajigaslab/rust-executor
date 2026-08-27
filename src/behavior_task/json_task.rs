@@ -86,16 +86,16 @@ impl Number {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Length {
-  Arcs{value: Number},
-  Pixels{value: Number},
+  Arcs(Angle),
+  Pixels(Number),
 }
 
 impl Length {
   fn render(&self, context: &TaskContext) -> f64 {
     let params = &context.config();
     match self {
-      Self::Pixels { value } => { value.render(context) }
-      Self::Arcs { value } => {
+      Self::Pixels(value) => { value.render(context) }
+      Self::Arcs (value) => {
         let screen_distance_m = params["screen_distance_m"].as_f64().unwrap();
         let screen_dpi = params["screen_dpi"].as_f64().unwrap();
         //pixels/radian ~ (pixels/inch)*(inch/cm)*(cm/m)*(distance_m) for small angles (x ~ tan(x))
@@ -108,15 +108,15 @@ impl Length {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Angle {
-  Radians{value: Number},
-  Degrees{value: Number},
+  Radians(Number),
+  Degrees(Number),
 }
 
 impl Angle {
   fn render(&self, context: &TaskContext) -> f64 {
     match self {
-      Self::Radians { value } => { value.render(context) }
-      Self::Degrees { value } => { std::f64::consts::PI/180.0*value.render(context) }
+      Self::Radians(value) => { value.render(context) }
+      Self::Degrees(value) => { std::f64::consts::PI/180.0*value.render(context) }
     }
   }
 }
@@ -138,9 +138,33 @@ impl Named for LocationPool {
   }
 }
 
+impl Named for ImagePool {
+  fn name(&self) -> &str {
+    self.name.as_str()
+  }
+}
+
 impl Named for TargetPool {
   fn name(&self) -> &str {
     self.name.as_str()
+  }
+}
+
+impl Named for LocationPoolExecutor {
+  fn name(&self) -> &str {
+    self.config.name.as_str()
+  }
+}
+
+impl Named for ImagePoolExecutor {
+  fn name(&self) -> &str {
+    self.config.name.as_str()
+  }
+}
+
+impl Named for TargetPoolExecutor {
+  fn name(&self) -> &str {
+    self.config.name.as_str()
   }
 }
 
@@ -154,7 +178,7 @@ fn get_named<'a, T: Named>(list: &'a mut Vec<T>, name: &str) -> &'a mut T {
 }
 
 impl Location {
-  fn render(&self, root: &mut DeclTask, context: &TaskContext) -> (f64, f64) {
+  fn render(&self, root: &mut DeclTaskExecutor, context: &TaskContext) -> (f64, f64) {
     match self {
       Self::Polar { radius, angle, origin } => {
         let radius = radius.render(context);
@@ -229,9 +253,15 @@ pub enum PathOp {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub enum Image {
+pub enum ImageImp {
   Path(Vec<PathOp>),
   Pool(String),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Image {
+  name: String,
+  imp: ImageImp,
 }
 
 pub struct ImageRender {
@@ -245,9 +275,9 @@ impl ImageRender {
 }
 
 impl Image {
-  fn render(&self, root: &mut DeclTask, context: &TaskContext) -> ImageRender {
-    match self {
-      Self::Path(path) => {
+  fn render(&self, root: &mut DeclTaskExecutor, context: &TaskContext) -> ImageRender {
+    match &self.imp {
+      ImageImp::Path(path) => {
         let mut builder = skia_safe::PathBuilder::new();
         for op in path {
           match op {
@@ -263,8 +293,8 @@ impl Image {
         }
         ImageRender { path: builder.detach() }
       }
-      Self::Pool(pool) => {
-        let image = get_named(&mut root.images, pool).pop();  // borrow of self.locations ends here
+      ImageImp::Pool(pool) => {
+        let image = get_named(&mut root.images, pool.as_str()).pop();  // borrow of self.locations ends here
         image.render(root, context)                                  // self is free again
       }
     }
@@ -283,10 +313,10 @@ pub struct TargetRender {
 }
 
 impl Target {
-  fn render(&self, root: &mut DeclTask, context: &TaskContext) -> Target {
+  fn render(&self, root: &mut DeclTaskExecutor, context: &TaskContext) -> TargetRender {
     let location = self.location.render(root, context);
     let image = self.image.render(root, context);
-    Target { location, image }
+    TargetRender { location, image }
   }
 }
 
@@ -317,6 +347,124 @@ pub struct DeclTask {
 }
 
 impl DeclTask {
+}
+
+pub struct LocationPoolExecutor {
+  config: LocationPool,
+  sequence: Vec<usize>,
+  index: usize
+}
+
+impl LocationPoolExecutor {
+  fn new(config: LocationPool) -> LocationPoolExecutor {
+    let sequence = match &config.imp {
+      LocationPoolImp::List(locations) => {
+        (0..locations.len()).collect()
+      },
+      _ => vec![],
+    };
+    LocationPoolExecutor { config, sequence, index: 0 }
+  }
+
+  fn pop(&mut self) -> Location {
+    match &self.config.imp {
+      LocationPoolImp::List(locations) => {
+        let location_index: usize = self.sequence[self.index];
+        self.index += 1;
+        locations[location_index].clone()
+      }
+    }
+  }
+
+  fn reset(&mut self) {
+    self.index = 0;
+  }
+}
+
+pub struct ImagePoolExecutor {
+  config: ImagePool,
+  sequence: Vec<usize>,
+  index: usize
+}
+
+impl ImagePoolExecutor {
+  fn new(config: ImagePool) -> ImagePoolExecutor {
+    let sequence = match &config.imp {
+      ImagePoolImp::List(images) => {
+        (0..images.len()).collect()
+      },
+      _ => vec![],
+    };
+    ImagePoolExecutor { config, sequence, index: 0 }
+  }
+
+  fn pop(&mut self) -> Image {
+    match &self.config.imp {
+      ImagePoolImp::List(images) => {
+        let image_index: usize = self.sequence[self.index];
+        self.index += 1;
+        images[image_index].clone()
+      }
+    }
+  }
+
+  fn reset(&mut self) {
+    self.index = 0;
+  }
+}
+
+pub struct TargetPoolExecutor {
+  config: TargetPool,
+  sequence: Vec<usize>,
+  index: usize
+}
+
+impl TargetPoolExecutor {
+  fn new(config: TargetPool) -> TargetPoolExecutor {
+    let sequence = match &config.imp {
+      TargetPoolImp::List(targets) => {
+        (0..targets.len()).collect()
+      },
+      _ => vec![],
+    };
+    TargetPoolExecutor { config, sequence, index: 0 }
+  }
+
+  fn pop(&mut self) -> Target {
+    match &self.config.imp {
+      TargetPoolImp::List(targets) => {
+        let target_index: usize = self.sequence[self.index];
+        self.index += 1;
+        targets[target_index].clone()
+      }
+    }
+  }
+
+  fn reset(&mut self) {
+    self.index = 0;
+  }
+}
+
+pub struct StateExecutor {}
+
+pub struct DeclTaskExecutor {
+  config: DeclTask,
+  images: Vec<ImagePoolExecutor>,
+  locations: Vec<LocationPoolExecutor>,
+  targets: Vec<TargetPoolExecutor>,
+  states: Vec<StateExecutor>,
+}
+
+impl DeclTaskExecutor {
+  fn new(config: DeclTask) -> DeclTaskExecutor {
+    let images = config.images.iter().cloned()
+      .map(|c| ImagePoolExecutor::new(c)).collect();
+    let locations = config.locations.iter().cloned()
+      .map(|c| LocationPoolExecutor::new(c)).collect();
+    let targets = config.targets.iter().cloned()
+      .map(|c| TargetPoolExecutor::new(c)).collect();
+    DeclTaskExecutor { config, images, locations, targets, states: vec![] }
+  }
 }
 //
 //pub struct LocationPool<'a> {
@@ -373,14 +521,61 @@ impl JsonTask {
   }
 }
 
-pub const BASIC_DECL_TASK: DeclTask = DeclTask {
-  screen_distance_m: Number::Literal(0.0),
-  screen_dpi: Number::Literal(0.0),
-  images: vec![],
-  locations: vec![],
-  targets: vec![],
-  states: vec![],
-};
+pub fn basic_decl_task() -> DeclTask {
+  DeclTask {
+    screen_distance_m: Number::Literal(0.0),
+    screen_dpi: Number::Literal(0.0),
+    images: vec![ImagePool{
+      name: "Images".to_string(), 
+      imp: ImagePoolImp::List(vec![
+        Image {
+          name: "Square".to_string(),
+          imp: ImageImp::Path(vec![
+                 PathOp::MoveTo(Location::Cartesian {
+                   x: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "-x/2.0".to_string()))),
+                   y: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "-x/2.0".to_string()))),
+                   origin: Origin::Center }),
+                 PathOp::MoveTo(Location::Cartesian {
+                   x: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "x/2.0".to_string()))),
+                   y: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "-x/2.0".to_string()))),
+                   origin: Origin::Center }),
+                 PathOp::MoveTo(Location::Cartesian {
+                   x: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "x/2.0".to_string()))),
+                   y: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "x/2.0".to_string()))),
+                   origin: Origin::Center }),
+                 PathOp::MoveTo(Location::Cartesian {
+                   x: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "-x/2.0".to_string()))),
+                   y: Length::Arcs(Angle::Degrees(Number::Param("sample_size_deg".to_string(), "x/2.0".to_string()))),
+                   origin: Origin::Center })
+                 ])
+        }
+        
+      ])}],
+    locations: vec![LocationPool{
+      name: "Choices".to_string(),
+      imp: LocationPoolImp::List(vec![
+        Location::Polar {
+          radius: Length::Arcs(Angle::Degrees(Number::Literal(10.0))),
+          angle: Angle::Degrees(Number::Literal(0.0)),
+          origin: Origin::Center },
+        //Location::Polar {
+        //  radius: Length::Arcs(Angle::Degrees(Number::Literal(10.0))),
+        //  angle: Angle::Degrees(Number::Literal(180.0)),
+        //  origin: Origin::Center }
+      ])
+    }],
+    targets: vec![TargetPool{
+      name: "Choices".to_string(),
+      imp: TargetPoolImp::List(vec![
+        Target {
+          location: Location::Pool("Choices".to_string()),
+          image: Image::Pool("Images".to_string()),
+        }
+      ])
+    }],
+    states: vec![],
+  }
+}
 
 #[async_trait]
 impl BehaviorTask for JsonTask {
