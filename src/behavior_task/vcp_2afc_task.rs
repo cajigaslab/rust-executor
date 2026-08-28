@@ -206,8 +206,8 @@ impl Inner {
     }
   }
 
-  fn sync_config(&mut self, config: &serde_json::Value) {
-    let converter = Converter::from_config(config);
+  fn sync_config(&mut self, config: &serde_json::Value, context: &TaskContext) {
+    let converter = Converter::from_config(config, context.canvas_size());
     let _loc_eccentric_circle_num = config["loc_eccentric_circle_num"].as_i64().unwrap().try_into().unwrap();
     let _loc_polar_step_deg       = config["loc_polar_step_deg"].as_i64().unwrap().try_into().unwrap();
     let _loc_ecc_pix_min          = converter.deg_to_pixel_rel(config["loc_eccentricity_deg"]["min"].as_f64().unwrap());
@@ -264,11 +264,11 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
-      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/success_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/success_clip.wav").unwrap();
     let abort_sound =
-      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/failure_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/failure_clip.wav").unwrap();
     let failure_sound =
-      StaticSoundData::from_file(r"/home/jarl/thalamus-extensions/seokhee/timeout_failure.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/timeout_failure.wav").unwrap();
 
     Vcp2AfcTask {
       inner: parking_lot::Mutex::new(Inner {
@@ -479,14 +479,15 @@ fn draw_text(canvas: &Canvas, text: &str, x: f32, y: f32, background_color_qt: C
 impl BehaviorTask for Vcp2AfcTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
     let config = &context.config();
-    let converter = Converter::from_config(config);
-    let monitorsubj_w_pix: i32 = get_i64(&config["monitorsubj_W_pix"]) as i32;
-    let monitorsubj_h_pix: i32 = get_i64(&config["monitorsubj_H_pix"]) as i32;
+    let canvas_size = context.canvas_size();
+    let converter = Converter::from_config(config, canvas_size);
+    let monitorsubj_w_pix: i32 = canvas_size.0 as i32;
+    let monitorsubj_h_pix: i32 = canvas_size.1 as i32;
     let center = converter.center;
 
     let task_group = config["task_group"].as_str().unwrap();
     let num_choices = config.get("num_choices").unwrap().as_i64().unwrap().try_into().unwrap();
-    let choice_eccentricity = config.get("num_choices").unwrap().as_f64().unwrap();
+    let choice_eccentricity = config.get("choice_eccentricity").unwrap().as_f64().unwrap();
     let rand_pos: Vec<(i32, i32)> = get_valid_angles(num_choices, 0, 360).iter()
     .map(|ang_deg| {
       let ang_rad = deg_to_rad(*ang_deg as f64);
@@ -496,7 +497,7 @@ impl BehaviorTask for Vcp2AfcTask {
       (f.0 as i32, f.1 as i32)
     }).collect();
 
-    self.inner.lock().sync_config(config);
+    self.inner.lock().sync_config(config, &context);
 
     let sample_and_choices = if task_group == "Shapes" {
       let (sample_shape, correct_idx) = self.inner.lock().setup_sample_and_choices(num_choices);
@@ -504,7 +505,7 @@ impl BehaviorTask for Vcp2AfcTask {
       let targetpos_pix   = rand_pos[usize::try_from(correct_idx).unwrap()];
       //_static.
       //choice_pos = Some(rand_pos);
-      
+
       context.log(&format!("trial_summary_data.used_values targetposX_pix={}", targetpos_pix.0)).await;
       context.log(&format!("trial_summary_data.used_values targetposY_pix={}", targetpos_pix.1)).await;
       context.log(&format!("trial_summary_data.used_values sample_pos_x_pix={}", sample_pos_pix.0)).await;
@@ -717,7 +718,7 @@ impl BehaviorTask for Vcp2AfcTask {
       };
       context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
-      
+
       sleep(&gaze_queue, get_gaze, penalty_delay).await;
       return TaskResult { success: false, cancelled: false };
     }
@@ -832,7 +833,7 @@ impl BehaviorTask for Vcp2AfcTask {
         gaze_queue.notify(),
         point_condition(&gaze_queue, get_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
-          distance(valid_gaze, center) < accpt_gaze_radius_pix
+          distance(valid_gaze, targetpos_pix) < accpt_gaze_radius_pix
         }),
         choice_hold_duration,
         Some(blink_duration),
@@ -845,7 +846,7 @@ impl BehaviorTask for Vcp2AfcTask {
 
       let (new_trial_failure_rate, trial_success_count) = {
         let mut lock = self.inner.lock();
-        let g = self.inner.lock().gaze;
+        let g = lock.gaze;
         lock.gaze_failure_store.push(
           (gaze_valid(g.0, g.1, monitorsubj_w_pix, monitorsubj_h_pix), Color4f::new(255.0/255.0, 69.0/255.0, 0.0/255.0, 128.0/255.0)));
         context.play_sound(lock.failure_sound.clone());
@@ -1139,7 +1140,7 @@ impl BehaviorTask for Vcp2AfcTask {
       let (temp_gaze_x, temp_gaze_y) = gaze_valid(gaze.0, gaze.1, canvas_size.width, canvas_size.height);
       let drawn_text = &format!("({temp_gaze_x}, {temp_gaze_y})");
       draw_text(canvas, drawn_text, temp_gaze_x as f32, temp_gaze_y as f32, background_color); // Draw the text message
-      draw_text(canvas, "Gaze (pix): x = {temp_gaze_x}, y = {temp_gaze_y}", 0.0, 190.0, background_color);
+      draw_text(canvas, &format!("Gaze (pix): x = {temp_gaze_x}, y = {temp_gaze_y}"), 0.0, 190.0, background_color);
     }
   }
 }

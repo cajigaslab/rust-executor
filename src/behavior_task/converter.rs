@@ -27,9 +27,9 @@ impl Converter {
     }
   }
 
-  pub fn from_config(config: &serde_json::Value) -> Self {
-    let monitorsubj_w_pix: i32 = get_i64(&config["monitorsubj_W_pix"]) as i32;
-    let monitorsubj_h_pix: i32 = get_i64(&config["monitorsubj_H_pix"]) as i32;
+  pub fn from_config(config: &serde_json::Value, screen_size: (u32, u32)) -> Self {
+    let monitorsubj_w_pix: i32 = screen_size.0 as i32;
+    let monitorsubj_h_pix: i32 = screen_size.1 as i32;
     let monitorsubj_dist_m = config["monitorsubj_dist_m"].as_f64().unwrap();
     let monitorsubj_width_m = config["monitorsubj_width_m"].as_f64().unwrap();
     Converter::new(

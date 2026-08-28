@@ -28,6 +28,11 @@ pub fn shared_trial_counter() -> SharedTrialCounter {
 /// type). `context` is the session-wide `TaskContext` constructed once in
 /// `main::run_grpc` and shared with `touch_screen::run`/`eye_tracking::run`,
 /// not created here.
+///
+/// A `TaskConfig` arriving while a task is still running cancels it — the
+/// running task is dropped without completing and reported with
+/// `cancelled = true`. A `TaskConfig` with an empty `body` is a bare cancel;
+/// one with a non-empty `body` also runs as the next trial.
 pub async fn run(
   addr: String,
   current_task: SharedTask,
@@ -45,7 +50,28 @@ pub async fn run(
   let response = client.execution(outbound).await?;
   let mut inbound = response.into_inner();
 
-  while let Some(config) = inbound.message().await? {
+  // Holds a `TaskConfig` that arrived mid-trial — cancelling the previous
+  // task — and still needs to run, picked up instead of reading the next one
+  // off the stream.
+  let mut pending: Option<TaskConfig> = None;
+
+  loop {
+    let config = match pending.take() {
+      Some(config) => config,
+      None => match inbound.message().await? {
+        Some(config) => config,
+        None => break,
+      },
+    };
+
+    // An empty `body` is a bare cancel signal. One that interrupts a running
+    // task is handled in the `select!` below; reaching here means no task is
+    // running, so there's nothing to cancel and nothing to report.
+    if config.body.is_empty() {
+      tracing::info!("received a TaskConfig with an empty body and no task running; ignoring it");
+      continue;
+    }
+
     let body = body_of(&config);
     let task_type = task_type_of(&body);
     println!("task_type: {task_type}");
@@ -73,12 +99,47 @@ pub async fn run(
 
         context.begin_trial(body).await;
         context.log(&start_message).await;
-        let result = task.run(context.clone()).await;
+
+        // Run the task, but keep reading the execution stream alongside it:
+        // any `TaskConfig` that arrives mid-trial cancels the running task
+        // (dropped without completing, at its next await point). If that
+        // config carries a non-empty body it's queued to run next; an empty
+        // body is a bare cancel.
+        let outcome = tokio::select! {
+          result = task.run(context.clone()) => TrialOutcome::Finished(result),
+          message = inbound.message() => match message {
+            Ok(Some(next)) => TrialOutcome::Interrupted(next),
+            Ok(None) => TrialOutcome::StreamEnded,
+            Err(e) => {
+              tracing::error!("execution stream error while a task was running: {e}");
+              TrialOutcome::StreamEnded
+            }
+          }
+        };
+        println!("END!");
         context.log(&finished_message).await;
 
         *current_task.lock().unwrap() = None;
         trial_counter.fetch_add(1, Ordering::Relaxed);
-        result
+
+        match outcome {
+          TrialOutcome::Finished(result) => result,
+          TrialOutcome::Interrupted(next) => {
+            if next.body.is_empty() {
+              tracing::info!("task cancelled by an empty TaskConfig");
+            } else {
+              tracing::info!("task cancelled by a new TaskConfig; running it next");
+              pending = Some(next);
+            }
+            TaskResult {
+              success: false,
+              cancelled: true,
+            }
+          }
+          // The execution stream closed while the task was running; there's
+          // nothing left to report a result to.
+          TrialOutcome::StreamEnded => return Ok(()),
+        }
       }
       None => {
         tracing::warn!("no BehaviorTask registered for task_type {task_type:?}");
@@ -96,6 +157,18 @@ pub async fn run(
   }
 
   Ok(())
+}
+
+/// What ended a trial in `run`'s execution loop.
+enum TrialOutcome {
+  /// `task.run` returned on its own.
+  Finished(TaskResult),
+  /// A `TaskConfig` arrived mid-trial, cancelling the running task (dropped
+  /// without completing). Its body may be empty (a bare cancel) or carry the
+  /// next task to run.
+  Interrupted(TaskConfig),
+  /// The execution stream ended or errored while the task was running.
+  StreamEnded,
 }
 
 /// Parses `TaskConfig.body` as a JSON object, passed to `BehaviorTask::run` as

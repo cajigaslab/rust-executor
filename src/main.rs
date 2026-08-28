@@ -43,6 +43,7 @@ fn main() -> anyhow::Result<()> {
   // main thread to itself on most platforms.
   let grpc_current_task = current_task.clone();
   let grpc_window_position = window_position.clone();
+  let grpc_window_size = window_size.clone();
   let grpc_touch_path = touch_path.clone();
   let grpc_gaze_path = gaze_path.clone();
   let grpc_angular_scaling = angular_scaling.clone();
@@ -56,7 +57,15 @@ fn main() -> anyhow::Result<()> {
   std::thread::Builder::new()
     .name("grpc".to_string())
     .spawn(move || {
-      let runtime = match tokio::runtime::Runtime::new() {
+      // Standard multi-threaded runtime, but pinned to a single worker
+      // thread for debugging: tasks spawned onto it (task_controller, the
+      // touch/gaze overlays, analog connections, …) still run off the
+      // `block_on` below, just never more than one at a time.
+      let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+      {
         Ok(runtime) => runtime,
         Err(e) => {
           tracing::error!("failed to start Tokio runtime: {e}");
@@ -68,6 +77,7 @@ fn main() -> anyhow::Result<()> {
         grpc_current_task,
         context_tx,
         grpc_window_position,
+        grpc_window_size,
         grpc_touch_path,
         grpc_gaze_path,
         grpc_angular_scaling,
@@ -97,6 +107,7 @@ async fn run_grpc(
   current_task: SharedTask,
   context_tx: std::sync::mpsc::SyncSender<Arc<TaskContext>>,
   window_position: touch_screen::SharedWindowPosition,
+  window_size: touch_screen::SharedWindowSize,
   touch_path: touch_screen::SharedTouchPath,
   gaze_path: eye_tracking::SharedGazePath,
   angular_scaling: eye_tracking::SharedAngularScaling,
@@ -120,7 +131,7 @@ async fn run_grpc(
   // `main`, which needs the same instance for `gfx::run`.
   let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
     .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(analog_client, audio_manager));
+  let context = Arc::new(TaskContext::new(analog_client, audio_manager, window_size));
   let _ = context_tx.send(context.clone());
 
   // TOUCH_SCREEN and OCULOMATIC/ANGULAR_SCALING both just hit the context's
