@@ -9,9 +9,11 @@ mod state;
 mod task_controller;
 mod touch_screen;
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use behavior_task::{SharedTask, TaskContext};
+use clap::Parser;
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
 use pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use pb::thalamus_grpc::{ObservableChange, ObservableTransaction};
@@ -23,12 +25,26 @@ use tokio_stream::wrappers::ReceiverStream;
 /// if two nodes redirect to each other.
 const MAX_REDIRECTS: u32 = 8;
 
+/// Default TaskController/Thalamus gRPC endpoint.
+const DEFAULT_ADDR: &str = "http://127.0.0.1:50050";
+
+/// Command-line arguments.
+#[derive(Parser)]
+struct Args {
+  /// TaskController/Thalamus gRPC endpoint.
+  #[arg(default_value = DEFAULT_ADDR)]
+  addr: String,
+
+  /// Number of Tokio worker threads for the gRPC runtime. Omit for Tokio's
+  /// default (roughly one per CPU core).
+  #[arg(long)]
+  threads: Option<NonZeroUsize>,
+}
+
 fn main() -> anyhow::Result<()> {
   tracing_subscriber::fmt::init();
 
-  let addr = std::env::args()
-    .nth(1)
-    .unwrap_or_else(|| "http://127.0.0.1:50050".to_string());
+  let Args { addr, threads } = Args::parse();
 
   let current_task = behavior_task::shared_task();
   let window_position = touch_screen::shared_window_position();
@@ -57,7 +73,14 @@ fn main() -> anyhow::Result<()> {
   std::thread::Builder::new()
     .name("grpc".to_string())
     .spawn(move || {
-      let runtime = match tokio::runtime::Runtime::new() {
+      // Standard multi-threaded runtime; `--threads N` pins it to N worker
+      // threads (e.g. 1, for debugging), otherwise Tokio's default is used.
+      let mut builder = tokio::runtime::Builder::new_multi_thread();
+      builder.enable_all();
+      if let Some(threads) = threads {
+        builder.worker_threads(threads.get());
+      }
+      let runtime = match builder.build() {
         Ok(runtime) => runtime,
         Err(e) => {
           tracing::error!("failed to start Tokio runtime: {e}");
@@ -123,7 +146,7 @@ async fn run_grpc(
   // `main`, which needs the same instance for `gfx::run`.
   let audio_manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
     .expect("failed to open default audio device");
-  let context = Arc::new(TaskContext::new(analog_client, audio_manager));
+  let context = Arc::new(TaskContext::new(analog_client, audio_manager, window_size));
   let _ = context_tx.send(context.clone());
 
   // TOUCH_SCREEN and OCULOMATIC/ANGULAR_SCALING both just hit the context's

@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
