@@ -28,6 +28,7 @@ pub fn get_f64(value: &serde_json::Value) -> f64 {
   }
 }
 
+#[allow(unused)]
 pub fn get_i64(value: &serde_json::Value) -> i64 {
   match value {
     serde_json::Value::Object(_) => {

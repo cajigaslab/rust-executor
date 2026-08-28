@@ -1,5 +1,4 @@
 use num_traits::{Float, FloatConst};
-use super::config_util::{get_i64};
 
 //pub fn rad_to_deg<F: Float + FloatConst>(rad: F) -> F {
 //  rad * F::from(180.0).unwrap() / F::PI()

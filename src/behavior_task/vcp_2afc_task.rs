@@ -8,7 +8,7 @@ use parking_lot;
 use async_trait::async_trait;
 use kira::sound::static_sound::StaticSoundData;
 use super::converter::{Converter, deg_to_rad};
-use super::config_util::{get_f64, get_i64, get_color, get_f64_with_step};
+use super::config_util::{get_f64, get_color, get_f64_with_step};
 use rand::seq::{IndexedRandom, SliceRandom};
 
 use crate::pb::task_controller_grpc::TaskResult;

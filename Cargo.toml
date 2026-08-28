@@ -23,6 +23,7 @@ imgui-rs-vulkan-renderer = { version = "1.16", features = ["gpu-allocator"] }
 imgui-winit-support = "0.13"
 skia-safe = { version = "0.99", features = ["gpu", "vulkan"] }
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
 kira = "0.12.1"
 rand = "0.10.2"
 naga = { version = "26", features = ["wgsl-in", "spv-out"] }
