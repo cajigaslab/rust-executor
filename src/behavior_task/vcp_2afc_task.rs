@@ -264,11 +264,11 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
-      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/success_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/success_clip.wav").unwrap();
     let abort_sound =
-      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/failure_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/failure_clip.wav").unwrap();
     let failure_sound =
-      StaticSoundData::from_file(r"C:/thalamusextension/seokhee/timeout_failure.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/timeout_failure.wav").unwrap();
 
     Vcp2AfcTask {
       inner: parking_lot::Mutex::new(Inner {

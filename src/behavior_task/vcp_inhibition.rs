@@ -1424,6 +1424,11 @@ impl VcpInhibitionTask {
 #[async_trait]
 impl BehaviorTask for VcpInhibitionTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
+    *self.trial.lock().unwrap() = None;
+    *self.state.lock().unwrap() = None;
+    *self.screen_gaze_queue.lock().unwrap() = None;
+    *self.last_gaze.lock().unwrap() = (99999, 99999);
+
     let config = &context.config();
     let monitorsubj_w_pix = get_i64(config, "monitorsubj_W_pix");
     let monitorsubj_h_pix = get_i64(config, "monitorsubj_H_pix");
