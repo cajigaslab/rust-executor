@@ -13,16 +13,17 @@ use skia_safe::gradient::{
 use skia_safe::{
   Canvas, Color4f, Font, FontMgr, Paint, PaintStyle, Path, PathBuilder, Rect, Shader, TileMode,
 };
+use tokio::sync::Notify;
 
 use crate::analog::PointSubscription;
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::{BehaviorTask, TaskContext, Window, wait_for, wait_for_hold};
+use super::{BehaviorTask, TaskContext, Window};
 
-const SUCCESS_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\success_clip.wav";
-const ABORT_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\failure_clip.wav";
-const FAILURE_SOUND_PATH: &str = r"C:\ThalamusExtension\seokhee\timeout_failure.wav";
+const SUCCESS_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\success_clip.wav";
+const ABORT_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\failure_clip.wav";
+const FAILURE_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav";
 
 /// This task's gaze feed — `TaskContext::subscribe_to_gaze`, the same feed
 /// `eye_tracking::run_overlay` and the operator overlay read, rather than a
@@ -98,6 +99,14 @@ impl Converter {
       (y_pix + self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
     )
   }
+
+  /// Converts absolute pixels (top-left origin) to degrees relative to the screen center.
+  fn relpix_to_reldeg(&self, x_pix: f64, y_pix: f64) -> (f64, f64) {
+    (
+      (x_pix - self.screen_pixels.0 / 2.0) * self.deg_per_pixel,
+      (y_pix - self.screen_pixels.1 / 2.0) * self.deg_per_pixel,
+    )
+  }
 }
 
 /// The target-location parameters read from config, and the positions
@@ -161,6 +170,14 @@ struct VcpSetup {
   trial_saccade_failure_count: AtomicU64,
   trial_catch_count: AtomicU64,
   trial_catch_success_count: AtomicU64,
+  /// Aborts/failures that occur on a `TrialType::Catch` trial — kept
+  /// separate from `trial_saccade_abort_count`/`trial_saccade_failure_count`
+  /// so catch-trial events never inflate the saccade-only abort/failure
+  /// rates. Not currently surfaced as their own rate, since nothing reads
+  /// them for that; they exist purely to keep catch trials from bleeding
+  /// into the saccade counters.
+  trial_catch_abort_count: AtomicU64,
+  trial_catch_failure_count: AtomicU64,
   consecutive_non_success: AtomicU64,
   background_color_qt: Color4f,
   photodiode_blinking_square: Color4f,
@@ -306,34 +323,52 @@ fn pick_random_value(min_val: f64, max_val: f64, step: f64) -> f64 {
     .expect("pick_random_value: empty range of possible values")
 }
 
-/// Ported from the Python task's `gaussian_gradient` (lines 49-63): builds a
-/// radial "Gaussian" falloff shader — grayscale brightness decaying from the
-/// center toward `background_color`'s red channel (matching the Python
-/// source's use of only the red channel for brightness), fully transparent
-/// at the outer edge.
+/// Ported from the Python task's `gaussian_gradient` (lines 49-63), extended
+/// to actually apply `target_color` (the Python source, and this port until
+/// now, only ever passed a fixed white/255 "brightness" here, so the target
+/// always rendered grayscale regardless of the `target_color` config field —
+/// see `target_color_rgb` at this function's call site): builds a radial
+/// "Gaussian" falloff shader per color channel, decaying from `target_color`
+/// at the center to `background_color` at the edge, fully transparent at the
+/// outer edge.
 fn gaussian_gradient_shader(
   background_color: Color4f,
   radius: f32,
   deviations: f32,
-  brightness_in: f32,
+  target_color: (f64, f64, f64),
   luminance_percent: f32,
 ) -> Shader {
   const RESOLUTION: usize = 1000;
-  let bg_r = background_color.r * 255.0;
-  let bg_g = background_color.g * 255.0;
-  let bg_b = background_color.b * 255.0;
-  let brightness = (brightness_in - bg_r) * luminance_percent / 100.0 + bg_r;
+  let bg = [
+    background_color.r * 255.0,
+    background_color.g * 255.0,
+    background_color.b * 255.0,
+  ];
+  let target = [
+    target_color.0 as f32,
+    target_color.1 as f32,
+    target_color.2 as f32,
+  ];
+  let brightness = [
+    (target[0] - bg[0]) * luminance_percent / 100.0 + bg[0],
+    (target[1] - bg[1]) * luminance_percent / 100.0 + bg[1],
+    (target[2] - bg[2]) * luminance_percent / 100.0 + bg[2],
+  ];
+  let bg_is_black = bg[0] == 0.0 && bg[1] == 0.0 && bg[2] == 0.0;
 
   let mut colors: Vec<Color4f> = (0..RESOLUTION)
     .map(|i| {
       let t = deviations * i as f32 / RESOLUTION as f32;
-      let level = if bg_r == 0.0 && bg_g == 0.0 && bg_b == 0.0 {
-        brightness * (-(t * t) / 2.0).exp()
-      } else {
-        bg_r + (brightness - bg_r) * (-(t * t) / 2.0).exp()
+      let falloff = (-(t * t) / 2.0).exp();
+      let channel = |c: usize| {
+        let level = if bg_is_black {
+          brightness[c] * falloff
+        } else {
+          bg[c] + (brightness[c] - bg[c]) * falloff
+        };
+        level.trunc() / 255.0
       };
-      let level = level.trunc() / 255.0;
-      Color4f::new(level, level, level, 1.0)
+      Color4f::new(channel(0), channel(1), channel(2), 1.0)
     })
     .collect();
   colors.push(Color4f::new(
@@ -652,6 +687,7 @@ struct TrialState {
   shader: Shader,
   /// Ported from lines 842-853: the fixation cross path, in pixel space.
   cross: Path,
+  cross_line_width_pix: f64,
   off_opacity: f64,
   accpt_fix_radius_pix: f64,
   accpt_gaze_radius_pix: f64,
@@ -662,7 +698,7 @@ struct TrialState {
   stats: TrialStats,
   show_target: bool,
   luminance_targ_per: f64,
-  hide_during_hold: bool
+  hide_during_delay: bool
 }
 
 /// Trial-level counters/rates, computed once early in `run` (ported lines
@@ -699,6 +735,7 @@ pub struct VcpInhibitionTask {
   /// task (see its doc comment), so a trial's gaze subscription doesn't
   /// linger past that trial.
   screen_gaze_queue: Mutex<Option<GazeQueue>>,
+  last_gaze: Mutex<(i32, i32)>,
 }
 
 impl VcpInhibitionTask {
@@ -707,21 +744,133 @@ impl VcpInhibitionTask {
       trial: Mutex::new(None),
       state: Mutex::new(None),
       screen_gaze_queue: Mutex::new(None),
+      last_gaze: Mutex::new((99999, 99999)),
     }
+  }
+
+  /// Ported from `wait_for` (util.py:357-366): waits — event-driven, waking
+  /// on `notify` — until `condition` returns true or `timeout` elapses
+  /// (waits indefinitely if `timeout` is `None`), then returns `condition`'s
+  /// value at that point. `condition` is an opaque predicate — `wait_for`
+  /// has no notion of gaze or touch itself; a condition that cares about
+  /// gaze builds it via `gaze_condition` (see its doc comment) to consume a
+  /// `GazeQueue` internally, and callers pass that same queue's
+  /// `PointSubscription::notify()` here so a wakeup isn't missed.
+  async fn wait_for(
+    &self,
+    notify: &Notify,
+    condition: impl Fn() -> bool,
+    timeout: Option<Duration>,
+  ) -> bool {
+    let deadline = timeout.map(|d| Instant::now() + d);
+    loop {
+      // Constructed before the check below, per `PointSubscription::notify`'s
+      // doc comment, so a push racing with that check isn't missed.
+      let notified = notify.notified();
+      if condition() {
+        return true;
+      }
+      match deadline {
+        None => notified.await,
+        Some(deadline) => {
+          let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return condition();
+          };
+          tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(remaining) => {}
+          }
+        }
+      }
+    }
+  }
+
+  async fn sleep<'a, 'b>(&self, gaze_queue: &'a Arc<PointSubscription>,
+                         last_gaze: &'a Mutex<(i32, i32)>,
+                         duration: Duration) {
+    self.wait_for(
+      gaze_queue.notify(),
+      gaze_condition(gaze_queue, last_gaze, |_| { false }),
+      Some(duration)).await;
+  }
+
+  /// Ported from `wait_for_hold` (util.py:469-504, `include_blink = False`):
+  /// waits for `condition` to hold continuously for `hold_duration`,
+  /// tolerating brief lapses ("blinks") of up to `blink_duration` each (time
+  /// spent blinking doesn't count against `hold_duration`) — a lapse not
+  /// reacquired within `blink_duration` fails the hold. `blink_duration =
+  /// None` (as Python's `fixate_func` passes) waits indefinitely to
+  /// reacquire, so a lapse can never fail the hold that way.
+  ///
+  /// `blink_resets` is a newer `wait_for_hold` parameter (from a different
+  /// machine's util.py than the one this port otherwise follows): when
+  /// true, reacquiring after a blink restarts `hold_duration` from zero
+  /// instead of just excluding the time spent blinking (`hold_target_func`'s
+  /// saccade-trial branch passes `true`; every other call site here keeps
+  /// the old behavior via `false`).
+  ///
+  /// Returns whether the hold succeeded.
+  async fn wait_for_hold(
+    &self,
+    notify: &Notify,
+    condition: impl Fn() -> bool,
+    hold_duration: Duration,
+    blink_duration: Option<Duration>,
+    blink_resets: bool,
+  ) -> bool {
+    let mut start = Instant::now();
+    let mut time_spent_blinking = Duration::ZERO;
+
+    loop {
+      let Some(remaining) = (hold_duration + time_spent_blinking).checked_sub(start.elapsed())
+      else {
+        break;
+      };
+
+      let blinked = self
+        .wait_for(notify, || !condition(), Some(remaining))
+        .await;
+      if !blinked {
+        break;
+      }
+
+      //context.log("BehavState=blink").await;
+
+      let blink_start = Instant::now();
+      let reacquired = self.wait_for(notify, &condition, blink_duration).await;
+      if !reacquired {
+        return false;
+      }
+
+      if blink_resets {
+        start = Instant::now();
+        time_spent_blinking = Duration::ZERO;
+      } else {
+        time_spent_blinking += blink_start.elapsed();
+      }
+    }
+
+    true
   }
 
   /// Ported from the abort/failure block repeated after PRESENT_TARGET
   /// (lines 1272-1290) and DELAY (lines 1301-1321): records the failed
   /// gaze, logs the abort, plays `abort_sound`, bumps
-  /// `trial_saccade_abort_count`, logs the trial summary, sleeps
+  /// `trial_saccade_abort_count` (or `trial_catch_abort_count`, per
+  /// `trial_type` — these stages run before the catch/saccade branch point,
+  /// so a catch trial can abort here too, and must not inflate the
+  /// saccade-only abort rate), logs the trial summary, sleeps
   /// `penalty_delay`, and returns the failing `TaskResult` (Python's
   /// `return TaskResult(False)`).
   #[allow(clippy::too_many_arguments)]
   async fn abort_trial(
     &self,
+    gaze_queue: &Arc<PointSubscription>,
+    last_gaze: &Mutex<(i32, i32)>,
     context: &TaskContext,
     state: &VcpSetup,
     gaze: (i32, i32),
+    trial_type: TrialType,
     abort_state: State,
     abort_pulse_ms: u64,
     monitorsubj_w_pix: i32,
@@ -746,9 +895,11 @@ impl VcpInhibitionTask {
 
     context.play_sound(state.abort_sound.clone());
 
-    state
-      .trial_saccade_abort_count
-      .fetch_add(1, Ordering::Relaxed);
+    match trial_type {
+      TrialType::Saccade => &state.trial_saccade_abort_count,
+      TrialType::Catch => &state.trial_catch_abort_count,
+    }
+    .fetch_add(1, Ordering::Relaxed);
     context
       .log(&format!(
         "TRIAL_NUM={}, SACCADE_TRIAL_SUCCESS_COUNT={}, SACCADE_TRIAL_NUM={}, SACCADE_SUCCESS_RATE={:.2}%, CATCH_TRIAL_SUCCESS_COUNT={}, CATCH_TRIAL_NUM={}, CATCH_SUCCESS_RATE={:.2}%, ABORT_RATE={:.2}%, FAILURE_RATE={:.2}%",
@@ -778,7 +929,7 @@ impl VcpInhibitionTask {
         ))
         .await;
     }
-    tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+    self.sleep(gaze_queue, last_gaze, Duration::from_secs_f64(penalty_delay + extra)).await;
     if extra > 0.0 {
       state.consecutive_non_success.store(0, Ordering::Relaxed);
     }
@@ -801,7 +952,7 @@ impl VcpInhibitionTask {
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
     start_duration: Duration,
-    _blink_duration: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
   ) {
@@ -809,7 +960,8 @@ impl VcpInhibitionTask {
     context.log("BehavState=ACQUIRE_FIXATION").await;
     println!("{:?}", State::AcquireFixation);
 
-    wait_for_hold(
+    self
+      .wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -839,8 +991,8 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     accpt_fix_radius_pix: f64,
-    _accpt_gaze_radius_pix: f64,
-    _targetpos_pix: (i32, i32),
+    accpt_gaze_radius_pix: f64,
+    targetpos_pix: (i32, i32),
     present_target_duration: Duration,
     blink_duration: Duration,
     monitorsubj_w_pix: i32,
@@ -851,7 +1003,8 @@ impl VcpInhibitionTask {
     context.log("BehavState=PRESENT_TARGET").await;
     println!("{:?}", State::PresentTarget);
 
-    let success = wait_for_hold(
+    let success = self
+      .wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -906,7 +1059,8 @@ impl VcpInhibitionTask {
     context.log("BehavState=FIXATE").await;
     println!("{:?}", State::Fixate);
 
-    let success = wait_for_hold(
+    let success = self
+      .wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -960,7 +1114,9 @@ impl VcpInhibitionTask {
     context.log("BehavState=DELAY").await;
     println!("{:?}", State::Delay);
 
-    let success = wait_for_hold(
+    let now = Instant::now();
+    let mut success = self
+      .wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -997,8 +1153,9 @@ impl VcpInhibitionTask {
   /// Ported from `handle_go_cue_reaction` (lines 552-575): sets state to
   /// `GoCue`, logs it, then waits — via `wait_for_hold`, tolerating one
   /// blink — for the gaze to hold within `go_cue_radius_pix` of `center`
-  /// for a fixed 80ms, succeeding regardless of the hold's own result if
-  /// those 80ms actually elapsed (Python: `if time.perf_counter() - now >
+  /// for `go_cue_duration` (config key `go_cue_duration`, 80ms in the
+  /// Python source), succeeding regardless of the hold's own result if
+  /// that duration actually elapsed (Python: `if time.perf_counter() - now >
   /// duration_s: success = True`), then logs the post-reaction gaze in
   /// pixels/degrees. Returns whether the check succeeded.
   #[allow(clippy::too_many_arguments)]
@@ -1009,7 +1166,8 @@ impl VcpInhibitionTask {
     last_gaze: &Mutex<(i32, i32)>,
     center: (i32, i32),
     go_cue_radius_pix: f64,
-    _blink_duration: Duration,
+    go_cue_duration: Duration,
+    blink_duration: Duration,
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
@@ -1018,19 +1176,20 @@ impl VcpInhibitionTask {
     context.log("BehavState=GO_CUE").await;
     println!("{:?}", State::GoCue);
 
-    const DURATION: Duration = Duration::from_millis(80);
-    let success = wait_for_hold(
+    let now = Instant::now();
+    let mut success = self
+      .wait_for_hold(
         gaze_queue.notify(),
         gaze_condition(gaze_queue, last_gaze, |point| {
           let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
           distance(valid_gaze, center) < go_cue_radius_pix
         }),
-        DURATION,
+        go_cue_duration,
         Some(Duration::ZERO),
         false,
       )
       .await;
-    //if now.elapsed() > DURATION {
+    //if now.elapsed() > go_cue_duration {
     //  success = true;
     //}
 
@@ -1081,14 +1240,15 @@ impl VcpInhibitionTask {
     monitorsubj_w_pix: i32,
     monitorsubj_h_pix: i32,
     converter: &Converter,
-  ) -> bool {
+  ) -> (bool, Duration) {
     *self.state.lock().unwrap() = Some(State::AcquireTarget);
     context.log("BehavState=ACQUIRE_TARGET").await;
     println!("{:?}", State::AcquireTarget);
 
-    let success = match trial_type {
+    let (success, elapsed) = match trial_type {
       TrialType::Catch => {
-        wait_for_hold(
+        let ok = self
+          .wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1098,10 +1258,13 @@ impl VcpInhibitionTask {
             Some(blink_duration),
             false,
           )
-          .await
+          .await;
+        (ok, Duration::ZERO)
       }
       TrialType::Saccade => {
-        wait_for(
+        let acq_start = Instant::now();
+        let ok = self
+          .wait_for(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1109,7 +1272,8 @@ impl VcpInhibitionTask {
             }),
             Some(decision_timeout),
           )
-          .await
+          .await;
+        (ok, acq_start.elapsed())
       }
     };
 
@@ -1129,7 +1293,7 @@ impl VcpInhibitionTask {
       ))
       .await;
 
-    success
+    (success, elapsed)
   }
 
   /// Ported from `handle_hold_target`/`hold_target_func` (lines 608-633,
@@ -1168,7 +1332,8 @@ impl VcpInhibitionTask {
 
     let success = match trial_type {
       TrialType::Catch => {
-        wait_for_hold(
+        self
+          .wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1181,7 +1346,8 @@ impl VcpInhibitionTask {
           .await
       }
       TrialType::Saccade => {
-        wait_for_hold(
+        self
+          .wait_for_hold(
             gaze_queue.notify(),
             gaze_condition(gaze_queue, last_gaze, |point| {
               let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
@@ -1258,8 +1424,10 @@ impl VcpInhibitionTask {
 #[async_trait]
 impl BehaviorTask for VcpInhibitionTask {
   async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
-    self.trial.lock().unwrap().take();
-    self.state.lock().unwrap().take();
+    *self.trial.lock().unwrap() = None;
+    *self.state.lock().unwrap() = None;
+    *self.screen_gaze_queue.lock().unwrap() = None;
+    *self.last_gaze.lock().unwrap() = (99999, 99999);
 
     let config = &context.config();
     let monitorsubj_w_pix = get_i64(config, "monitorsubj_W_pix");
@@ -1311,6 +1479,8 @@ impl BehaviorTask for VcpInhibitionTask {
         trial_saccade_failure_count: AtomicU64::new(0),
         trial_catch_count: AtomicU64::new(0),
         trial_catch_success_count: AtomicU64::new(0),
+        trial_catch_abort_count: AtomicU64::new(0),
+        trial_catch_failure_count: AtomicU64::new(0),
         consecutive_non_success: AtomicU64::new(0),
         background_color_qt: Color4f::new(
           background_color.0 as f32 / 255.0,
@@ -1373,7 +1543,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // `run`'s several return points below is taken — see
     // `GazeQueueGuard`'s doc comment.
     let _gaze_queue_guard = GazeQueueGuard(self);
-    let last_gaze = Mutex::new((99999, 99999));
+    *self.last_gaze.lock().unwrap() = (99999, 99999);
 
     let catch_trial_rate = get_f64(config, "catch_trial_rate");
     let trial_type = if rand::rng().random::<f64>() < catch_trial_rate {
@@ -1395,6 +1565,13 @@ impl BehaviorTask for VcpInhibitionTask {
           let targetpos_pix = (x as i32, y as i32);
           let targetpos_pix_f = (targetpos_pix.0 as f64, targetpos_pix.1 as f64);
           println!("Current target position (pix): {targetpos_pix:?}");
+          let dx = x - state.center_f.0;
+          let dy = state.center_f.1 - y;
+          let angle_deg = dy.atan2(dx).to_degrees();
+          let eccentricity_deg = (dx * dx + dy * dy).sqrt() * state.converter.deg_per_pixel;
+          println!(
+            "Current target position (deg): angle={angle_deg:.1}, eccentricity={eccentricity_deg:.1}"
+          );
           target_positions.rand_pos_i += 1;
           (targetpos_pix, targetpos_pix_f)
         }
@@ -1415,6 +1592,26 @@ impl BehaviorTask for VcpInhibitionTask {
           targetpos_pix.1
         ))
         .await;
+
+      // Recovers the polar angle/eccentricity this position in `rand_pos` was
+      // originally generated from (`compute_target_positions` only keeps the
+      // resulting (x, y) pixel pairs, not the angle/radius that produced
+      // them), by inverting its `center_f + radius * (cos(angle), -sin(angle))`
+      // formula.
+      let dx = targetpos_pix_f.0 - state.center_f.0;
+      let dy = state.center_f.1 - targetpos_pix_f.1;
+      let targetpos_deg = dy.atan2(dx).to_degrees();
+      let targetpos_ecc = (dx * dx + dy * dy).sqrt() * state.converter.deg_per_pixel;
+      context
+        .log(&format!(
+          "trial_summary_data.used_values targetpos_deg={targetpos_deg}"
+        ))
+        .await;
+      context
+        .log(&format!(
+          "trial_summary_data.used_values targetpos_ecc={targetpos_ecc}"
+        ))
+        .await;
     }
 
     // Ported from lines 842-853: build the fixation cross path (two
@@ -1433,6 +1630,9 @@ impl BehaviorTask for VcpInhibitionTask {
     cross_builder.line_to((vertices[3].0 as f32, vertices[3].1 as f32));
     let cross: Path = cross_builder.detach();
 
+    // Line width (pixels) of the fixation cross stroke drawn in `render`.
+    let cross_line_width_pix = get_f64(config, "cross_line_width_pix");
+
     // Ported from line 687 (before the one-time setup block, so read every
     // trial): controls the alpha of the fixation cross / catch-trial cue in
     // several `render` states.
@@ -1448,16 +1648,28 @@ impl BehaviorTask for VcpInhibitionTask {
     let accpt_fix_radius_deg = get_f64(config, "accpt_fix_radius_deg");
     let accpt_fix_radius_pix = state.converter.deg_to_pixel_rel(accpt_fix_radius_deg);
     
-    let accpt_gaze_radius_deg = if trial_type == TrialType::Catch {
-      get_f64(config, "accpt_catch_gaze_radius_deg")
+    let accpt_gaze_radius_pix = if trial_type == TrialType::Catch {
+      let r_deg = get_f64(config, "accpt_catch_gaze_radius_deg");
+      state.converter.deg_to_pixel_rel(r_deg)
     } else {
-      get_f64(config, "accpt_saccade_gaze_radius_deg")
+      let acct_gaze_radius_deg = get_f64(config, "accpt_saccade_gaze_radius_deg");
+      let gaze_radius_gain = get_f64(config, "gaze_radius_gain");
+      let ecc_pix = f64::hypot(
+        targetpos_pix.0 as f64 - state.center.0 as f64,
+        targetpos_pix.1 as f64 - state.center.1 as f64,
+      );
+      let ecc_deg = ecc_pix * state.converter.deg_per_pixel;
+      let r_deg = gaze_radius_gain * ecc_deg + acct_gaze_radius_deg;
+      // let r_deg = gaze_radius_gain * ecc_deg;
+      context.log(&format!(
+        "trial_summary_data.used_values accpt_gaze_radius_pix={:.1} ecc_deg={:.2} gaze_radius_gain={:.3}",
+        state.converter.deg_to_pixel_rel(r_deg), ecc_deg, gaze_radius_gain
+      )).await;
+      state.converter.deg_to_pixel_rel(r_deg)
     };
-    // let accpt_gaze_radius_deg = get_f64(config, "accpt_gaze_radius_deg");
-    let accpt_gaze_radius_pix = state.converter.deg_to_pixel_rel(accpt_gaze_radius_deg);
     let is_height_locked = get_bool(config, "is_height_locked");
     let paint_all_targets = get_bool(config, "paint_all_targets");
-    let hide_during_hold = get_bool(config, "hide_during_hold");
+    let hide_during_delay = get_bool(config, "hide_during_delay");
     let target_color_rgb = get_rgb(config, "target_color");
     let background_color = get_rgb(config, "background_color");
     let background_color_qt = Color4f::new(
@@ -1473,6 +1685,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
     let decision_timeout = get_value(config, &context, "decision_timeout").await / 1000.0;
     let start_duration = get_f64(config, "start_duration") / 1000.0;
+    let go_cue_duration = get_f64(config, "go_cue_duration") / 1000.0;
     let fix_duration = get_value(config, &context, "fix_duration").await / 1000.0;
     let del_duration = get_value(config, &context, "del_duration").await / 1000.0;
     let present_target_duration =
@@ -1546,7 +1759,7 @@ impl BehaviorTask for VcpInhibitionTask {
       background_color_qt,
       width_targ_pix as f32 / 2.0,
       3.0,
-      255.0,
+      target_color_rgb,
       100.0,
     );
     println!(
@@ -1558,7 +1771,6 @@ impl BehaviorTask for VcpInhibitionTask {
 
     let _ = (
       paint_all_targets,
-      target_color_rgb,
       decision_timeout,
       hold_target_duration,
       penalty_delay,
@@ -1627,13 +1839,14 @@ impl BehaviorTask for VcpInhibitionTask {
       height_targ_pix,
       shader,
       cross,
+      cross_line_width_pix,
       off_opacity,
       accpt_fix_radius_pix,
       accpt_gaze_radius_pix,
       stats: trial_stats,
       show_target: false,
       luminance_targ_per,
-      hide_during_hold
+      hide_during_delay
     });
 
     match trial_type {
@@ -1667,7 +1880,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_acquire_fixation(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(start_duration),
@@ -1689,7 +1902,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_fixate(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(fix_duration),
@@ -1702,12 +1915,15 @@ impl BehaviorTask for VcpInhibitionTask {
     context.inject_analog("state_in", state_in_pulse(20)).await;
 
     if !fixate_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortFixation,
           50,
           monitorsubj_w_pix as i32,
@@ -1727,7 +1943,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_present_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         accpt_gaze_radius_pix,
@@ -1745,12 +1961,15 @@ impl BehaviorTask for VcpInhibitionTask {
     // target presentation, aborts the trial — Python's `return
     // TaskResult(False)`.
     if !present_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortTarget,
           150,
           monitorsubj_w_pix as i32,
@@ -1770,7 +1989,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_delay(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         accpt_fix_radius_pix,
         Duration::from_secs_f64(del_duration),
@@ -1786,12 +2005,15 @@ impl BehaviorTask for VcpInhibitionTask {
     // delay, aborts the trial (as above, but tagged ABORT_DELAY with a
     // 300ms pulse instead of ABORT_TARGET's 150ms).
     if !delay_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortDelay,
           300,
           monitorsubj_w_pix as i32,
@@ -1821,9 +2043,10 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_go_cue_reaction(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         state.center,
         go_cue_radius_pix,
+        Duration::from_secs_f64(go_cue_duration),
         Duration::from_secs_f64(blink_duration),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
@@ -1836,12 +2059,15 @@ impl BehaviorTask for VcpInhibitionTask {
     // (Python's `# await context.log('Duration=...')` there is commented
     // out, unlike DELAY's own) no duration log.
     if !go_cue_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       return self
         .abort_trial(
+          &gaze_queue,
+          &self.last_gaze,
           &context,
           state,
           gaze,
+          trial_type,
           State::AbortDelay,
           300,
           monitorsubj_w_pix as i32,
@@ -1863,11 +2089,11 @@ impl BehaviorTask for VcpInhibitionTask {
 
     // Ported from lines 1364-1370: waits for target acquisition (saccade
     // trials) or continued center fixation (catch trials).
-    let acquire_target_success = self
+    let (acquire_target_success, acquire_elapsed) = self
       .handle_acquire_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         trial_type,
         state.center,
         targetpos_pix,
@@ -1890,7 +2116,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // sleep in two around a `show_target` toggle (see `render`'s
     // `FailureSaccade` branch), so not reused via `abort_trial`.
     if !acquire_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       let valid_gaze = gaze_valid(
         gaze.0,
         gaze.1,
@@ -1907,9 +2133,11 @@ impl BehaviorTask for VcpInhibitionTask {
       println!("{:?}", State::FailureSaccade);
       context.inject_analog("state_in", state_in_pulse(450)).await;
 
-      state
-        .trial_saccade_failure_count
-        .fetch_add(1, Ordering::Relaxed);
+      match trial_type {
+        TrialType::Saccade => &state.trial_saccade_failure_count,
+        TrialType::Catch => &state.trial_catch_failure_count,
+      }
+      .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
@@ -1944,9 +2172,9 @@ impl BehaviorTask for VcpInhibitionTask {
           .await;
       }
       self.trial.lock().unwrap().as_mut().unwrap().show_target = false;
-      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
       self.trial.lock().unwrap().as_mut().unwrap().show_target = true;
-      tokio::time::sleep(Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64((penalty_delay + extra) / 2.0)).await;
       if extra > 0.0 {
         state.consecutive_non_success.store(0, Ordering::Relaxed);
       }
@@ -1963,7 +2191,7 @@ impl BehaviorTask for VcpInhibitionTask {
       .handle_hold_target(
         &context,
         &gaze_queue,
-        &last_gaze,
+        &self.last_gaze,
         trial_type,
         state.center,
         targetpos_pix,
@@ -1971,7 +2199,7 @@ impl BehaviorTask for VcpInhibitionTask {
         accpt_gaze_radius_pix,
         Duration::from_secs_f64(hold_target_duration),
         Duration::from_secs_f64(blink_duration),
-        Duration::from_secs_f64(decision_timeout),
+        Duration::from_secs_f64(decision_timeout).saturating_sub(acquire_elapsed),
         monitorsubj_w_pix as i32,
         monitorsubj_h_pix as i32,
         &state.converter,
@@ -1983,7 +2211,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // pulse and no split sleep this time (unlike FAILURE_SACCADE), doesn't
     // bump `trial_saccade_abort_count`.
     if !hold_target_success {
-      let gaze = *last_gaze.lock().unwrap();
+      let gaze = *self.last_gaze.lock().unwrap();
       let valid_gaze = gaze_valid(
         gaze.0,
         gaze.1,
@@ -1999,9 +2227,11 @@ impl BehaviorTask for VcpInhibitionTask {
       *self.state.lock().unwrap() = Some(State::FailureHold);
       println!("{:?}", State::FailureHold);
 
-      state
-        .trial_saccade_failure_count
-        .fetch_add(1, Ordering::Relaxed);
+      match trial_type {
+        TrialType::Saccade => &state.trial_saccade_failure_count,
+        TrialType::Catch => &state.trial_catch_failure_count,
+      }
+      .fetch_add(1, Ordering::Relaxed);
       context.play_sound(state.failure_sound.clone());
 
       context
@@ -2033,7 +2263,7 @@ impl BehaviorTask for VcpInhibitionTask {
           ))
           .await;
       }
-      tokio::time::sleep(Duration::from_secs_f64(penalty_delay + extra)).await;
+      self.sleep(&gaze_queue, &self.last_gaze, Duration::from_secs_f64(penalty_delay + extra)).await;
       if extra > 0.0 {
         state.consecutive_non_success.store(0, Ordering::Relaxed);
       }
@@ -2048,7 +2278,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // `success_sound`, releases the reward pulse, bumps the
     // trial-type-appropriate success counter, and logs/prints the same
     // summary shape as the abort/failure branches above.
-    let gaze = *last_gaze.lock().unwrap();
+    let gaze = *self.last_gaze.lock().unwrap();
     let valid_gaze = gaze_valid(
       gaze.0,
       gaze.1,
@@ -2069,7 +2299,7 @@ impl BehaviorTask for VcpInhibitionTask {
     context.play_sound(state.success_sound.clone());
     // 1s delay to allow playing the sound; it doesn't play without this.
     // tokio::time::sleep(Duration::from_secs(1)).await;
-    tokio::time::sleep(std::time::Duration::from_secs_f64(reward_delay)).await;
+    self.sleep(&gaze_queue, &self.last_gaze, std::time::Duration::from_secs_f64(reward_delay)).await;
 
     let reward_total_released_ms = {
       let mut total = state.reward_total_released_ms.lock().unwrap();
@@ -2125,7 +2355,7 @@ impl BehaviorTask for VcpInhibitionTask {
     println!("{summary}");
 
     
-    tokio::time::sleep(std::time::Duration::from_secs_f64(0.35)).await;
+    self.sleep(&gaze_queue, &self.last_gaze, std::time::Duration::from_secs_f64(0.5)).await;
 
     // Ported from lines 1448-1450: Python always returns `TaskResult(False)`
     // here, regardless of the trial's outcome — per its own comment, a
@@ -2171,10 +2401,11 @@ impl BehaviorTask for VcpInhibitionTask {
       accpt_fix_radius_pix,
       accpt_gaze_radius_pix,
       cross,
+      cross_line_width_pix,
       stats,
-      _show_target,
+      show_target,
       luminance_targ_per,
-      hide_during_hold,
+      hide_during_delay,
     )) = self.trial.lock().unwrap().as_ref().map(|t| {
       (
         t.background_color_qt,
@@ -2184,10 +2415,11 @@ impl BehaviorTask for VcpInhibitionTask {
         t.accpt_fix_radius_pix,
         t.accpt_gaze_radius_pix,
         t.cross.clone(),
+        t.cross_line_width_pix,
         t.stats,
         t.show_target,
         t.luminance_targ_per,
-        t.hide_during_hold,
+        t.hide_during_delay,
       )
     })
     else {
@@ -2203,14 +2435,7 @@ impl BehaviorTask for VcpInhibitionTask {
     // state machine still needs to see. `None` both before the first
     // trial's `run` has set `screen_gaze_queue` and after the current
     // trial's `run` has cleared it (see `GazeQueueGuard`).
-    let gaze = self
-      .screen_gaze_queue
-      .lock()
-      .unwrap()
-      .as_ref()
-      .and_then(|queue| queue.latest())
-      .map(|(x, y)| (x.round() as i32, y.round() as i32))
-      .unwrap_or((99999, 99999));
+    let gaze = self.last_gaze.lock().unwrap();
     let valid_gaze = gaze_valid(
       gaze.0,
       gaze.1,
@@ -2231,38 +2456,15 @@ impl BehaviorTask for VcpInhibitionTask {
       State::AcquireFixation | State::Fixate => {
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
+        pen.set_stroke_width(cross_line_width_pix as f32);
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
-      }
-      State::Delay => {
-        let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
-        pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
-        pen.set_anti_alias(true);
-        canvas.draw_path(&cross, &pen);
-        if trial_type == TrialType::Saccade {
-          self.draw_gaussian(canvas, off_luminance);
-        }
-      }
-      State::GoCue => {
-        current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
-        if trial_type == TrialType::Catch {
-          let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
-          pen.set_style(PaintStyle::Stroke);
-          pen.set_stroke_width(2.0);
-          pen.set_anti_alias(true);
-          canvas.draw_path(&cross, &pen);
-        }
-        if trial_type == TrialType::Saccade {
-          self.draw_gaussian(canvas, off_luminance);
-        }
       }
       State::PresentTarget => {
         current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
         let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
         pen.set_style(PaintStyle::Stroke);
-        pen.set_stroke_width(2.0);
+        pen.set_stroke_width(cross_line_width_pix as f32);
         pen.set_anti_alias(true);
         canvas.draw_path(&cross, &pen);
         if trial_type == TrialType::Saccade {
@@ -2272,22 +2474,43 @@ impl BehaviorTask for VcpInhibitionTask {
           self.draw_gaussian(canvas, 1.0);
         }
       }
+      State::Delay => {
+        let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, 1.0), None);
+        pen.set_style(PaintStyle::Stroke);
+        pen.set_stroke_width(cross_line_width_pix as f32);
+        pen.set_anti_alias(true);
+        canvas.draw_path(&cross, &pen);
+        if trial_type == TrialType::Saccade {
+          if current_state == State::Delay {
+            if !hide_during_delay {
+              self.draw_gaussian(canvas, off_luminance);
+            }
+          }
+        }
+      }
+      State::GoCue => {
+        current_photodiode_static_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
+        if trial_type == TrialType::Catch {
+          let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
+          pen.set_style(PaintStyle::Stroke);
+          pen.set_stroke_width(cross_line_width_pix as f32);
+          pen.set_anti_alias(true);
+          canvas.draw_path(&cross, &pen);
+        }
+        if trial_type == TrialType::Saccade {
+          self.draw_gaussian(canvas, off_luminance);
+        }
+      }
       State::HoldTarget | State::AcquireTarget => {
         if trial_type == TrialType::Catch {
           let mut pen = Paint::new(Color4f::new(1.0, 0.0, 0.0, off_opacity as f32), None);
           pen.set_style(PaintStyle::Stroke);
-          pen.set_stroke_width(2.0);
+          pen.set_stroke_width(cross_line_width_pix as f32);
           pen.set_anti_alias(true);
           canvas.draw_path(&cross, &pen);
         } 
-        else {
-          if current_state == State::HoldTarget {
-            if !hide_during_hold {
-              self.draw_gaussian(canvas, off_luminance);
-            }
-          } else {
-            self.draw_gaussian(canvas, off_luminance);
-          }
+        if trial_type == TrialType::Saccade {
+          self.draw_gaussian(canvas, off_luminance);
         }
       }
       State::FailureSaccade => {

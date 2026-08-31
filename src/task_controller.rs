@@ -119,7 +119,7 @@ pub async fn run(
         println!("END!");
         context.log(&finished_message).await;
 
-        *current_task.lock().unwrap() = None;
+        //*current_task.lock().unwrap() = None;
         trial_counter.fetch_add(1, Ordering::Relaxed);
 
         match outcome {

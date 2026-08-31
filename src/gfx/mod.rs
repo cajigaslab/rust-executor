@@ -34,7 +34,7 @@ use window_target::{MAX_FRAMES_IN_FLIGHT, SwapchainWindow};
 
 /// Background color for both views, so a blank scene reads as blank in both
 /// places.
-const BLANK_CLEAR_COLOR: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
+const BLANK_CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// Initial resolution of both offscreen render targets — backed by
 /// `crate::canvas`, the fixed canvas space touch/gaze input is rescaled
