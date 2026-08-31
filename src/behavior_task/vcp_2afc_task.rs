@@ -137,8 +137,8 @@ impl Inner {
 
     self.loc_rand_pos = iproduct!(radii, angles_rad)
       .map(|(r, a)| (
-        center.0 + ((r + a.cos()) as i32), 
-        center.1 + ((r + a.sin()) as i32)))
+        center.0 + ((r*a.cos()) as i32), 
+        center.1 + ((r*a.sin()) as i32)))
       .collect();
     self.loc_rand_pos.shuffle(&mut rand::rng());
     self.loc_rand_pos_i = 0
@@ -629,6 +629,8 @@ impl BehaviorTask for Vcp2AfcTask {
       let mut lock = self.inner.lock();
       lock.gaussian = Some(gaussian);
       lock.orientation_targ_ran = orientation_targ_ran;
+      lock.width_targ_pix = width_targ_pix;
+      lock.height_targ_pix = height_targ_pix;
     }
 
     context.log(&format!("{}", config.to_string())).await;
