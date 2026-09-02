@@ -264,11 +264,11 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/success_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/success_clip.wav").expect("success_clip.wav not found");
     let abort_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/failure_clip.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/failure_clip.wav").expect("failure_clip.wav not found");
     let failure_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/timeout_failure.wav").unwrap();
+      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/timeout_failure.wav").expect("timeout_failure.wav not found");
 
     Vcp2AfcTask {
       inner: parking_lot::Mutex::new(Inner {
@@ -584,6 +584,7 @@ impl BehaviorTask for Vcp2AfcTask {
     let choice_present_duration = Duration::from_millis(get_f64(&config["choice_present_duration"]) as u64);
     let choice_hold_duration = Duration::from_millis(get_f64(&config["choice_hold_duration"]) as u64);
     let blink_duration = Duration::from_millis(get_f64(&config["blink_duration"]) as u64);
+    let start_duration = Duration::from_millis(get_f64(&config["start_duration"]) as u64);
 
     let reward_per_trial = get_f64(&config["reward_per_trial"]); // return a uniform random number
 
@@ -655,13 +656,15 @@ impl BehaviorTask for Vcp2AfcTask {
     };
 
     self.set_state(&context, "BehavState=ACQUIRE_FIXATION_post-drawing", State::AcquireFixation).await;
-    wait_for(
+    wait_for_hold(
       gaze_queue.notify(),
       point_condition(&gaze_queue, get_gaze, |point| {
         let valid_gaze = gaze_valid(point.0, point.1, monitorsubj_w_pix, monitorsubj_h_pix);
         distance(valid_gaze, center) < accpt_fix_radius_pix
       }),
+      start_duration,
       None,
+      false
     )
     .await;
 
