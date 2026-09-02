@@ -9,6 +9,17 @@ fn handle_err(e: HandleError) -> anyhow::Error {
   anyhow!("{e:?}")
 }
 
+/// Whether `name` appears in a list returned by one of the
+/// `enumerate_*_extension_properties` calls.
+fn has_extension(properties: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
+  properties.iter().any(|ext| {
+    ext
+      .extension_name_as_c_str()
+      .map(|ext_name| ext_name == name)
+      .unwrap_or(false)
+  })
+}
+
 /// Vulkan objects shared by every window: one instance, one physical device, one
 /// logical device and a single graphics/present queue used for all rendering.
 pub struct VulkanBase {
@@ -75,8 +86,23 @@ impl VulkanBase {
       }
     }
 
+    // On platforms whose only Vulkan implementation is a portability driver
+    // (MoltenVK on macOS), the loader hides those drivers unless the instance
+    // opts in via `VK_KHR_portability_enumeration` + the matching create flag.
+    let available_instance_extensions =
+      unsafe { entry.enumerate_instance_extension_properties(None)? };
+    let mut instance_flags = vk::InstanceCreateFlags::empty();
+    if has_extension(
+      &available_instance_extensions,
+      ash::khr::portability_enumeration::NAME,
+    ) {
+      required_extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+      instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+    }
+
     let instance_create_info = vk::InstanceCreateInfo::default()
       .application_info(&app_info)
+      .flags(instance_flags)
       .enabled_extension_names(&required_extensions)
       .enabled_layer_names(&enabled_layers);
 
@@ -102,7 +128,17 @@ impl VulkanBase {
       .queue_priorities(&queue_priorities);
     let queue_create_infos = [queue_create_info];
 
-    let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+    // `VK_KHR_portability_subset` must be enabled whenever the physical device
+    // advertises it (Vulkan spec requirement); MoltenVK always does.
+    let available_device_extensions =
+      unsafe { instance.enumerate_device_extension_properties(physical_device)? };
+    let mut device_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
+    if has_extension(
+      &available_device_extensions,
+      ash::khr::portability_subset::NAME,
+    ) {
+      device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+    }
     let device_create_info = vk::DeviceCreateInfo::default()
       .queue_create_infos(&queue_create_infos)
       .enabled_extension_names(&device_extensions);
