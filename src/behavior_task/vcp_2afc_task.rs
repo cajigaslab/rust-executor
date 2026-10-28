@@ -264,11 +264,11 @@ fn distance(a: (i32, i32), b: (i32, i32)) -> f64 {
 impl Vcp2AfcTask {
   pub fn new() -> Vcp2AfcTask {
     let success_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/success_clip.wav").expect("success_clip.wav not found");
+      StaticSoundData::from_cursor(std::io::Cursor::new(include_bytes!("../../assets/success_clip.wav").as_slice())).expect("bundled success_clip.wav should decode");
     let abort_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/failure_clip.wav").expect("failure_clip.wav not found");
+      StaticSoundData::from_cursor(std::io::Cursor::new(include_bytes!("../../assets/failure_clip.wav").as_slice())).expect("bundled failure_clip.wav should decode");
     let failure_sound =
-      StaticSoundData::from_file(r"C:/thalamus-extensions/seokhee/timeout_failure.wav").expect("timeout_failure.wav not found");
+      StaticSoundData::from_cursor(std::io::Cursor::new(include_bytes!("../../assets/timeout_failure.wav").as_slice())).expect("bundled timeout_failure.wav should decode");
 
     Vcp2AfcTask {
       inner: parking_lot::Mutex::new(Inner {

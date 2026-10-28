@@ -17,9 +17,9 @@ use clap::Parser;
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
 use pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use pb::thalamus_grpc::{ObservableChange, ObservableTransaction};
-use serde_json::Value;
+use state::{Bridge, State};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Bound on chained `observable_bridge_v2` redirects, to avoid looping forever
 /// if two nodes redirect to each other.
@@ -160,26 +160,28 @@ async fn run_grpc(
   // screen coordinates (see `eye_tracking::factory_angular_scaling`).
   context.set_gaze_factory(eye_tracking::factory_angular_scaling());
 
-  let mut app_state = Value::Object(Default::default());
+  let app_state = context.app_state();
 
   // Resolve the observable_bridge_v2 stream, following a redirect if the first
   // (and, per Thalamus's server, only ever the first) message carries one. See
   // `Service::observable_bridge_v2` in grpc_impl.cpp.
   let mut inbound = None;
-  // Kept alive for the rest of this function once resolved below: dropping the
-  // sender closes our half of the bidi stream, which makes the server end the
-  // whole RPC (see the `while (stream->Read(&in))` loop in
-  // `Service::observable_bridge_v2` in grpc_impl.cpp) even though we never send
-  // anything on it.
-  let mut outbound_keepalive = None;
+  // Owns the sending half of the bidi stream once resolved below, and is
+  // installed as `app_state`'s remote storage so local writes go to Thalamus.
+  // Dropping the sender closes our half of the stream, which makes the server
+  // end the whole RPC (see the `while (stream->Read(&in))` loop in
+  // `Service::observable_bridge_v2` in grpc_impl.cpp).
+  let mut bridge = None;
   for _ in 0..MAX_REDIRECTS {
     let channel = tonic::transport::Channel::from_shared(addr.clone())?
       .connect()
       .await?;
     let mut thalamus = ThalamusClient::new(channel);
 
-    let (tx, rx) = mpsc::channel::<ObservableTransaction>(8);
-    let outbound = ReceiverStream::new(rx);
+    // Unbounded: writes to `app_state` can come from any thread, including
+    // non-async ones, so `Bridge` can't wait for room in a bounded channel.
+    let (tx, rx) = mpsc::unbounded_channel::<ObservableTransaction>();
+    let outbound = UnboundedReceiverStream::new(rx);
 
     tracing::info!("connecting to observable_bridge_v2 at {addr}");
     let response = thalamus.observable_bridge_v2(outbound).await?;
@@ -195,16 +197,18 @@ async fn run_grpc(
       continue;
     }
 
-    apply_transaction(&mut app_state, &first.changes, &angular_scaling)?;
+    apply_transaction(&app_state, None, &first, &angular_scaling);
+    let resolved = Bridge::new(tx);
+    resolved.install(&app_state);
     inbound = Some(stream);
-    outbound_keepalive = Some(tx);
+    bridge = Some(resolved);
     break;
   }
 
   let Some(mut inbound) = inbound else {
     anyhow::bail!("too many observable_bridge_v2 redirects (last target: {addr})");
   };
-  let _outbound_keepalive = outbound_keepalive;
+  let bridge = bridge.expect("set whenever inbound is");
 
   // Only now that the observable_bridge_v2 address is resolved (post-redirect,
   // if any) do we connect the TaskController's execution stream, to the same
@@ -237,39 +241,47 @@ async fn run_grpc(
     }
   });
 
-  while let Some(transaction) = inbound.message().await? {
-    apply_transaction(&mut app_state, &transaction.changes, &angular_scaling)?;
+  let result = async {
+    while let Some(transaction) = inbound.message().await? {
+      apply_transaction(&app_state, Some(&bridge), &transaction, &angular_scaling);
+    }
+    anyhow::Ok(())
   }
+  .await;
 
-  Ok(())
+  // The stream is gone: stop routing writes to it, so they apply locally.
+  app_state.set_remote_storage(None);
+  result
 }
 
+/// Applies one inbound `observable_bridge_v2` transaction to `app_state` —
+/// through `bridge` once it exists, which also handles acknowledgements of
+/// our own writes — then refreshes the cached `AngularScaling` if the
+/// transaction touched `['eye_scaling']`.
 fn apply_transaction(
-  app_state: &mut Value,
-  changes: &[ObservableChange],
+  app_state: &State,
+  bridge: Option<&Bridge>,
+  transaction: &ObservableTransaction,
   angular_scaling: &eye_tracking::SharedAngularScaling,
-) -> anyhow::Result<()> {
-  let mut eye_scaling_changed = false;
-  for change in changes {
-    if touches_eye_scaling(&change.address) {
-      eye_scaling_changed = true;
-    }
-    let action = change.action();
-    if let Err(e) = state::apply_change(app_state, &change.address, &change.value, action) {
-      tracing::warn!("failed to apply change {change:?}: {e}");
-    }
+) {
+  match bridge {
+    Some(bridge) => bridge.handle(app_state, transaction),
+    None => state::apply_changes(app_state, &transaction.changes),
   }
-  if eye_scaling_changed {
-    eye_tracking::refresh_angular_scaling(app_state, angular_scaling);
+  if transaction.changes.iter().any(touches_eye_scaling) {
+    let eye_scaling = app_state.get("eye_scaling").map_or(serde_json::Value::Null, |v| v.to_json());
+    eye_tracking::refresh_angular_scaling(
+      &serde_json::json!({ "eye_scaling": eye_scaling }),
+      angular_scaling,
+    );
   }
-  //println!("{}", serde_json::to_string_pretty(app_state)?);
-  Ok(())
 }
 
 /// Whether an `observable_bridge_v2` change address falls under
 /// `['eye_scaling']` (or replaces the whole tree, address `""`), meaning the
 /// cached `AngularScaling` config may be stale and needs refreshing.
-fn touches_eye_scaling(address: &str) -> bool {
+fn touches_eye_scaling(change: &ObservableChange) -> bool {
+  let address = change.address.trim();
   address.is_empty() || address.starts_with("['eye_scaling']")
 }
 

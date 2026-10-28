@@ -21,9 +21,9 @@ use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 use super::{BehaviorTask, TaskContext, Window};
 
-const SUCCESS_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\success_clip.wav";
-const ABORT_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\failure_clip.wav";
-const FAILURE_SOUND_PATH: &str = r"C:\Thalamus-Extensions\seokhee\timeout_failure.wav";
+static SUCCESS_SOUND_DATA: &[u8] = include_bytes!("../../assets/success_clip.wav");
+static ABORT_SOUND_DATA: &[u8] = include_bytes!("../../assets/failure_clip.wav");
+static FAILURE_SOUND_DATA: &[u8] = include_bytes!("../../assets/timeout_failure.wav");
 
 /// This task's gaze feed — `TaskContext::subscribe_to_gaze`, the same feed
 /// `eye_tracking::run_overlay` and the operator overlay read, rather than a
@@ -1451,11 +1451,11 @@ impl BehaviorTask for VcpInhibitionTask {
       let center_f = (center.0 as f64, center.1 as f64);
 
       let success_sound =
-        StaticSoundData::from_file(SUCCESS_SOUND_PATH).expect("failed to load success_clip.wav");
+        StaticSoundData::from_cursor(std::io::Cursor::new(SUCCESS_SOUND_DATA)).expect("failed to load success_clip.wav");
       let abort_sound =
-        StaticSoundData::from_file(ABORT_SOUND_PATH).expect("failed to load failure_clip.wav");
+        StaticSoundData::from_cursor(std::io::Cursor::new(ABORT_SOUND_DATA)).expect("failed to load failure_clip.wav");
       let failure_sound =
-        StaticSoundData::from_file(FAILURE_SOUND_PATH).expect("failed to load timeout_failure.wav");
+        StaticSoundData::from_cursor(std::io::Cursor::new(FAILURE_SOUND_DATA)).expect("failed to load timeout_failure.wav");
 
       let photodiode_blinking_square = Color4f::new(1.0, 1.0, 1.0, 1.0);
       let photodiode_static_square = Color4f::new(0.0, 0.0, 0.0, 1.0);

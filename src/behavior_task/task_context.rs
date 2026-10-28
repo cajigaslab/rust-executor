@@ -14,6 +14,7 @@ use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{
   AnalogResponse, InjectAnalogRequest, NodeSelector, Text, inject_analog_request,
 };
+use crate::state::State;
 
 /// How `TaskContext` builds the touch/gaze feed every [`Self::subscribe_to_touch`]/
 /// [`Self::subscribe_to_gaze`] caller gets back — see
@@ -117,7 +118,10 @@ pub struct TaskContext {
   /// Live `analog` connections opened via [`Self::connect`], keyed by
   /// [`ConnectionKey`] and weakly held — see that method's doc comment.
   connections: Mutex<HashMap<ConnectionKey, Weak<Connection>>>,
-  _canvas_size: Arc<Mutex<(u32, u32)>>
+  _canvas_size: Arc<Mutex<(u32, u32)>>,
+  /// Thalamus' application state (its whole config), kept in sync over
+  /// `observable_bridge_v2` by `main::run_grpc` — see [`Self::app_state`].
+  app_state: State,
 }
 
 impl TaskContext {
@@ -134,7 +138,19 @@ impl TaskContext {
       injected_gaze: PointBroadcast::new(),
       connections: Mutex::new(HashMap::new()),
       _canvas_size: canvas_size,
+      app_state: State::make_dict(),
     }
+  }
+
+  /// Thalamus' application state (Python's `TaskContext.config`, the whole
+  /// Thalamus config — not the per-trial task config, see [`Self::config`]).
+  /// Mirrored from Thalamus over `observable_bridge_v2` (see
+  /// `main::run_grpc`), so it starts out empty and fills in once that
+  /// stream connects. Writes are sent to Thalamus and only show up here once
+  /// Thalamus echoes them back; pass a callback to `State::set_with` etc. to
+  /// find out when that's happened.
+  pub fn app_state(&self) -> State {
+    self.app_state.clone()
   }
 
   /// Registers `factory` as how [`Self::subscribe_to_touch`] builds the

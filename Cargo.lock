@@ -2468,6 +2468,7 @@ dependencies = [
  "imgui",
  "imgui-rs-vulkan-renderer",
  "imgui-winit-support",
+ "indexmap",
  "itertools 0.15.0",
  "kira",
  "libc",

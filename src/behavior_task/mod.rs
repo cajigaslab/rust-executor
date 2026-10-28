@@ -1,4 +1,5 @@
 mod simple_arc;
+mod simple_touch_task;
 mod task_context;
 mod vcp_inhibition;
 mod vcp_2afc_task;
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::pb::task_controller_grpc::TaskResult;
 
 pub use simple_arc::SimpleArcTask;
+pub use simple_touch_task::SimpleTouchTask;
 pub use task_context::{PointSubscription, TaskContext};
 pub use vcp_inhibition::VcpInhibitionTask;
 pub use vcp_2afc_task::Vcp2AfcTask;
@@ -72,6 +74,10 @@ pub fn registry() -> HashMap<String, Arc<dyn BehaviorTask>> {
   map.insert(
     "simple".to_string(),
     Arc::new(SimpleArcTask::new()),
+  );
+  map.insert(
+    "simple_touch_task".to_string(),
+    Arc::new(SimpleTouchTask::new()),
   );
   map.insert(
     "VCP_inhibition_task".to_string(),
