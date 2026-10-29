@@ -2481,6 +2481,7 @@ dependencies = [
  "rand",
  "raw-window-handle",
  "serde_json",
+ "signals2",
  "skia-safe",
  "tokio",
  "tokio-stream",
@@ -2671,6 +2672,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signals2"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc108c224058c29e227807435200520695bbf24eb2522ceef234e2c4e1247c3c"
 
 [[package]]
 name = "simd-adler32"
