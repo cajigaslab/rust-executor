@@ -116,10 +116,28 @@ pub enum Value {
   Null,
 }
 
+pub trait IntoKey {
+  fn into_key(self) -> Key;
+}
+impl IntoKey for Key {
+  fn into_key(self) -> Key { self }
+}
+impl IntoKey for &str {
+  fn into_key(self) -> Key { Key::String(self.to_string()) }
+}
+impl IntoKey for String {
+  fn into_key(self) -> Key { Key::String(self) }
+}
+impl IntoKey for i64 {   // use whatever integer type StateKey::Int holds
+  fn into_key(self) -> Key { Key::Int(self) }
+}
+impl IntoKey for i32 {   // use whatever integer type StateKey::Int holds
+  fn into_key(self) -> Key { Key::Int(self as i64) }
+}
+
 pub trait IntoValue {
   fn into_value(self) -> Value;
 }
-
 impl IntoValue for Value {
   fn into_value(self) -> Value { self }
 }
@@ -218,25 +236,6 @@ impl TryFrom<Value> for String {
   }
 }
 
-impl IntoIterator for &ObservableDict {
-  type Item = (Key, Value);
-  type IntoIter = std::vec::IntoIter<(Key, Value)>;
-
-  fn into_iter(self) -> Self::IntoIter {
-    let vec: Vec<(Key, Value)> = self.common.lock().content.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    vec.into_iter()
-  }
-}
-
-impl IntoIterator for &ObservableList {
-  type Item = Value;
-  type IntoIter = std::vec::IntoIter<Value>;
-
-  fn into_iter(self) -> Self::IntoIter {
-    self.common.lock().content.clone().into_iter()
-  }
-}
-
 static NEXT_ID: Mutex<u64> = Mutex::new(0 as u64);
 
 fn get_id() -> u64 {
@@ -247,143 +246,181 @@ fn get_id() -> u64 {
 }
 
 type RemoteStorage = Arc<dyn Fn(Action, &str, Value, Box<dyn FnOnce()>)>;
+//type ObserverLock<'a> = MutexGuard<'a, Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>>;
 
-struct ObservableCollection<T: Content + std::fmt::Debug + 'static> {
-  content: T,
-  id: u64,
-  observers: Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>,
-  remote_storage: Option<RemoteStorage>,
-  parent: Option<Collection>,
-  is_map: bool
-}
-
-impl<T: Content + std::fmt::Debug + 'static> std::fmt::Debug for ObservableCollection<T> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("ObservableCollection").field("content", &self.content).finish()
-  }
-}
-
-impl<T: Content + std::fmt::Debug + 'static> ObservableCollection<T> {
-  fn new(content: T) -> ObservableCollection<T> {
-    let is_map = TypeId::of::<T>() == TypeId::of::<HashMap<Key, Value>>();
-    ObservableCollection { content, id: get_id(), observers: vec![], remote_storage: None, parent: None, is_map }
-  }
+trait ObservableCollection {
+  fn entries(&self) -> Vec<(Key, Value)>;
+  fn parent(&self) -> &Weak<dyn ObservableCollection>;
+  fn parent_mut(&mut self) -> &mut Weak<dyn ObservableCollection>;
+  fn observers(&self) -> &Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>;
+  fn observers_mut(&mut self) -> &mut Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>;
+  fn as_value(&self) -> Value;
+  fn remote_storage(&self) -> &Option<RemoteStorage>;
+  fn remote_storage_mut(&mut self) -> &mut Option<RemoteStorage>;
+  fn id(&self) -> u64;
 
   fn find_remote_storage(&self) -> Option<RemoteStorage> {
-    match self.remote_storage.as_ref() {
+    match self.remote_storage().as_ref() {
       Some(r) => Some(r.clone()),
       None => {
-        match self.parent.as_ref() {
-          Some(Collection::Dict(d)) => d.common.lock().find_remote_storage(),
-          Some(Collection::List(d)) => d.common.lock().find_remote_storage(),
+        match self.parent().upgrade() {
+          Some(parent) => parent.find_remote_storage(),
           None => None
         }
       }
     }
   }
 
+  fn address(&self) -> String {
+    let (prefix, end_opt) = match self.parent().upgrade() {
+      Some(parent) => (parent.address(), parent.key_of(&self.as_value())),
+      None => return "".to_string()
+    };
+
+    match end_opt {
+      Some(Key::Int(i)) => format!("{prefix}[{i}]"),
+      Some(Key::String(i)) => format!("{prefix}['{i}']"),
+      None => panic!("Failed to find self in parent collection")
+    }
+  }
+
   fn key_of(&self, value: &Value) -> Option<Key> {
-    for (k, v) in self.content.entries() {
-      if v == value {
+    for (k, v) in self.entries() {
+      if v == *value {
         return Some(k);
       }
     }
 
     None
   }
+}
 
-  fn address(&self, outer: &Value) -> String {
-    let (prefix, end_opt) = match self.parent.as_ref() {
-      Some(Collection::Dict(d)) => (d.address(), d.key_of(outer)),
-      Some(Collection::List(d)) => (d.address(), d.key_of(outer)),
-      None => return "".to_string()
-    };
+fn connect<F: Fn(&Collection, Action, &Key, &Value) + 'static>(
+  this: &Arc<Mutex<impl ObservableCollection + 'static>>,
+  callback: F,
+) -> OnDrop {
+  let mut lock = this.lock();
+  let id = get_id();
+  lock.observers_mut().push((id, Arc::new(callback)));
 
-    match end_opt {
-      Some(Key::Int(i)) => format!("{prefix}[{i}]"),
-      Some(Key::String(i)) => format!("{prefix}[{i}]"),
-      None => panic!("Failed to find self in parent collection")
+  let weak = Arc::downgrade(this);
+  OnDrop::new(move || {
+    if let Some(this) = weak.upgrade() {
+      this.lock().observers_mut().retain(|(i, _)| *i != id);
     }
-  }
-
-  fn connect<F: Fn(&Collection, Action, &Key, &Value) + 'static>(
-    this: &Arc<Mutex<ObservableCollection<T>>>,
-    callback: F,
-  ) -> OnDrop {
-    let mut lock = this.lock();
-    let id = get_id();
-    lock.observers.push((id, Arc::new(callback)));
-
-    let weak = Arc::downgrade(&this);
-    OnDrop::new(move || {
-      if let Some(this) = weak.upgrade() {
-        this.lock().observers.retain(|(i, _)| *i != id);
-      }
-    })
-  }
+  })
 }
 
 impl PartialEq for ObservableDict {
   fn eq(&self, other: &Self) -> bool {
-    self.common.lock().id == other.common.lock().id
+    self.id() == other.id()
   }
 }
 impl Eq for ObservableDict {}
 
 impl PartialEq for ObservableList {
   fn eq(&self, other: &Self) -> bool {
-    self.common.lock().id == other.common.lock().id
+    self.id() == other.id()
   }
 }
 impl Eq for ObservableList {}
 
-#[derive(Debug,Clone)]
+#[derive(Clone)]
 pub struct ObservableDict {
-  common: Arc<Mutex<ObservableCollection<HashMap<Key, Value>>>>,
+  content: HashMap<Key, Value>,
+  id: u64,
+  observers: Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>,
+  remote_storage: Option<RemoteStorage>,
+  parent: Weak<dyn ObservableCollection>,
 }
 
-impl ObservableDict {
-  pub fn new() -> ObservableDict {
-    let init = HashMap::<Key, Value>::new();
-    let common = Arc::new(Mutex::new(ObservableCollection::new(init)));
-    ObservableDict { common }
+impl ObservableCollection for ObservableDict {
+  fn entries(&self) -> Vec<(Key, Value)> {
+    self.content.entries().map(|(k,v)| (k, v.clone())).collect()
   }
 
-  pub fn connect<T: Fn(&Collection, Action, &Key, &Value) + 'static>(
-    &self,
-    callback: T,
-  ) -> OnDrop {
-    ObservableCollection::connect(&self.common, callback)
+  fn parent(&self) -> &Weak<dyn ObservableCollection> {
+    &self.parent
+  }
+  fn parent_mut(&mut self) -> &mut Weak<dyn ObservableCollection> {
+    &mut self.parent
   }
 
-  pub fn address(&self) -> String {
-    self.common.lock().address(&Value::Dict(self.clone()))
+  fn observers(&self) -> &Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)> {
+    &self.observers
+  }
+  fn observers_mut(&mut self) -> &mut Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)> {
+    &mut self.observers
   }
 
-  pub fn key_of(&self, value: &Value) -> Option<Key> {
-    self.common.lock().key_of(value)
+  fn as_value(&self) -> Value {
+    Value::Dict(self.clone())
+  }
+
+  fn remote_storage(&self) -> &Option<RemoteStorage> {
+    &self.remote_storage
+  }
+  fn remote_storage_mut(&mut self) -> &mut Option<RemoteStorage> {
+    &mut self.remote_storage
+  }
+
+  fn id(&self) -> u64 {
+    self.id
   }
 }
 
-#[derive(Debug,Clone)]
+const _: () = {
+  fn assert_send_sync<T: Send + Sync>() {}
+  fn check() {
+    assert_send_sync::<ObservableDict>();
+  }
+}
+
+#[derive(Clone)]
 pub struct ObservableList {
-  common: Arc<Mutex<ObservableCollection<Vec<Value>>>>,
+  content: Vec<Value>,
+  id: u64,
+  observers: Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)>,
+  remote_storage: Option<RemoteStorage>,
+  parent: Weak<dyn ObservableCollection>,
+}
+
+impl ObservableCollection for ObservableList {
+  fn entries(&self) -> Vec<(Key, Value)> {
+    self.content.iter().enumerate().map(|(k,v)| ((k as i64).into_key(), v.clone())).collect()
+  }
+
+  fn parent(&self) -> &Weak<dyn ObservableCollection> {
+    &self.parent
+  }
+  fn parent_mut(&mut self) -> &mut Weak<dyn ObservableCollection> {
+    &mut self.parent
+  }
+
+  fn observers(&self) -> &Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)> {
+    &self.observers
+  }
+  fn observers_mut(&mut self) -> &mut Vec<(u64, Arc<dyn Fn(&Collection, Action, &Key, &Value)>)> {
+    &mut self.observers
+  }
+
+  fn as_value(&self) -> Value {
+    Value::List(self.clone())
+  }
+
+  fn remote_storage(&self) -> &Option<RemoteStorage> {
+    &self.remote_storage
+  }
+  fn remote_storage_mut(&mut self) -> &mut Option<RemoteStorage> {
+    &mut self.remote_storage
+  }
+
+  fn id(&self) -> u64 {
+    self.id
+  }
 }
 
 impl ObservableList {
-  pub fn new() -> ObservableList {
-    let init = Vec::<Value>::new();
-    let common = Arc::new(Mutex::new(ObservableCollection::new(init)));
-    ObservableList { common }
-  }
-
-  pub fn connect<T: Fn(&Collection, Action, &Key, &Value) + 'static>(
-    &self,
-    callback: T,
-  ) -> OnDrop {
-    ObservableCollection::connect(&self.common, callback)
-  }
-
   pub fn push_with(&self, value: impl IntoValue, callback: impl FnOnce() + 'static) {
     let mut lock = self.common.lock();
 
