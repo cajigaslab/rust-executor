@@ -1,27 +1,33 @@
 //! Port of Thalamus' state tree: the `ObservableCollection` classes from
 //! Python (`thalamus/config.py`) and C++ (`src/thalamus/state.hpp`/
-//! `state.cpp`), exposed through the same API as thalamus-contrib's
-//! FFI-backed `State` (`thalamus-contrib/rust/src/api.rs`) — `State`,
-//! `Value`, `StateKey`, `StateAction`, `StateEntry`, `IntoStateKey`,
-//! `IntoValue`, `OnDrop` — so code written against one reads the same
-//! against the other.
+//! `state.cpp`).
 //!
-//! A [`State`] is a cheap, clonable handle to one dict or list node in the
-//! tree. Beyond the contrib API it carries the rest of what the Python/C++
-//! classes do: change callbacks and the `from_remote` flag on every
-//! mutation (`*_with` methods), remote storage ([`State::set_remote_storage`]
-//! — how writes get routed to Thalamus instead of being applied locally, see
-//! [`Bridge`]), addresses, plain (non-recursive) observers, observers that
-//! remove themselves (`remove_when`), recap on connect, list `insert`/`pop`/
-//! `remove_val`/`extend`, `update`, `clear`, `copy`, JSON conversion, and
-//! JSONPath get/set/delete ([`get_jsonpath`] etc., a port of the C++
-//! grammar).
+//! The tree's nodes are [`Dict`]s and [`List`]s, held through an `Arc` and
+//! safe to use from any thread; they're the public interface. A [`Value`]
+//! holding a node says which kind it is, as does a [`Coll`], which
+//! observers are passed. Inside this module both kinds share one
+//! implementation through `Coll`'s private methods. Each method
+//! call is atomic, but a sequence of calls isn't: other threads' changes can
+//! land in between.
 //!
-//! Observers run synchronously on whichever thread made the change, after
-//! the tree's own locks have been released, so they may freely read or
-//! write the tree themselves. An observer that (directly or indirectly)
-//! triggers itself isn't re-entered: the nested notification is skipped
-//! with a warning.
+//! Each mutation comes in three forms: `set` (fire and forget), `set_with`
+//! (with a callback for when it's done) and `set_direct` (applied locally
+//! whatever the remote storage, which is how changes from Thalamus get
+//! applied). Without `_direct`, writes go to the remote storage in effect
+//! ([`Dict::set_remote_storage`], see [`Bridge`]) instead of being applied
+//! locally. Addresses are in the JSONPath dialect [`get_jsonpath`] etc.
+//! understand (a port of the C++ grammar).
+//!
+//! Observers ([`Dict::connect`], [`List::connect`]) see changes to their
+//! node and all of its descendants, as C++'s recursive observers do. They
+//! run synchronously on whichever thread made the change, with no locks
+//! held, so they may freely read or write the tree themselves.
+//!
+//! Locking rule, which the compiler doesn't check and which a mistake turns
+//! into a silent deadlock: hold at most one node's lock at a time, and
+//! release it before calling out (observers, callbacks, remote storage),
+//! dropping tree values or closures, or locking any other node. (Node
+//! equality compares ids, so it doesn't lock.)
 
 // A general-purpose API mirroring the Python/C++/contrib classes; not every
 // method has a caller in the executor yet.
@@ -35,30 +41,17 @@ mod tests;
 pub use bridge::{Bridge, apply_changes};
 #[allow(unused_imports)]
 pub use jsonpath::{delete_jsonpath, get_jsonpath, set_jsonpath};
-use parking_lot::MutexGuard;
-use parking_lot::RawMutex;
 
-use std::any::TypeId;
-use std::cell::Ref;
-use std::cell::RefCell;
-use std::collections::HashSet;
 use std::collections::HashMap;
-use std::collections::hash_map;
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::rc::{Rc, Weak};
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use indexmap::IndexMap;
-use parking_lot::{Mutex, ReentrantMutex};
+use parking_lot::Mutex;
 use serde_json::Value as Json;
-use either::Either;
-
-use crate::state::Value::Coll;
 
 pub struct OnDrop {
-  action: Option<Box<dyn FnOnce()>>,
+  action: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl OnDrop {
@@ -67,7 +60,7 @@ impl OnDrop {
       action: Some(Box::new(|| {})),
     }
   }
-  pub fn new<F: FnOnce() + 'static>(f: F) -> OnDrop {
+  pub fn new<F: FnOnce() + Send + 'static>(f: F) -> OnDrop {
     OnDrop {
       action: Some(Box::new(f)),
     }
@@ -94,14 +87,115 @@ pub enum Key {
   String(String),
 }
 
+impl Key {
+  /// This key as one bracketed address segment, the way Python writes
+  /// addresses (`f'[{repr(key)}]'`): `[3]`, `['name']`.
+  fn address_segment(&self) -> String {
+    match self {
+      Key::Int(i) => format!("[{i}]"),
+      Key::String(s) => format!("[{}]", python_repr(s)),
+    }
+  }
+
+  fn list_index(&self) -> Option<usize> {
+    match self {
+      Key::Int(i) => usize::try_from(*i).ok(),
+      Key::String(_) => None,
+    }
+  }
+}
+
+/// Python's `repr` of a string: single-quoted unless that needs escaping
+/// and double quotes don't.
+fn python_repr(s: &str) -> String {
+  let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+  let mut out = String::with_capacity(s.len() + 2);
+  out.push(quote);
+  for c in s.chars() {
+    if c == quote || c == '\\' {
+      out.push('\\');
+    }
+    out.push(c);
+  }
+  out.push(quote);
+  out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
   Bool(bool),
-  Coll(Rc<Collection>),
+  Dict(Arc<Dict>),
+  List(Arc<List>),
   Float(f64),
   Int(i64),
   String(String),
   Null,
+}
+
+impl Value {
+  /// Converts parsed JSON, building fresh, detached collections for objects
+  /// and arrays.
+  pub fn from_json(json: &Json) -> Value {
+    match json {
+      Json::Null => Value::Null,
+      Json::Bool(b) => Value::Bool(*b),
+      Json::Number(n) => match n.as_i64() {
+        Some(i) => Value::Int(i),
+        None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+      },
+      Json::String(s) => Value::String(s.clone()),
+      Json::Array(items) => {
+        let list = List::new();
+        for item in items {
+          list.push_direct(Value::from_json(item), ||{});
+        }
+        Value::List(list)
+      }
+      Json::Object(map) => {
+        let dict = Dict::new();
+        for (key, value) in map {
+          dict.set_direct(key.as_str(), Value::from_json(value), ||{});
+        }
+        Value::Dict(dict)
+      }
+    }
+  }
+
+  /// A deep conversion to plain JSON. Non-finite floats become `null`, as
+  /// JSON has no representation for them.
+  pub fn to_json(&self) -> Json {
+    match self {
+      Value::Null => Json::Null,
+      Value::Bool(b) => Json::Bool(*b),
+      Value::Int(i) => Json::from(*i),
+      Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+      Value::String(s) => Json::String(s.clone()),
+      Value::Dict(c) => c.to_json(),
+      Value::List(c) => c.to_json(),
+    }
+  }
+
+  pub fn as_dict(&self) -> Option<&Arc<Dict>> {
+    match self {
+      Value::Dict(d) => Some(d),
+      _ => None,
+    }
+  }
+
+  pub fn as_list(&self) -> Option<&Arc<List>> {
+    match self {
+      Value::List(l) => Some(l),
+      _ => None,
+    }
+  }
+
+  fn as_coll(&self) -> Option<Coll> {
+    match self {
+      Value::Dict(c) => Some(Coll::Dict(c.clone())),
+      Value::List(c) => Some(Coll::List(c.clone())),
+      _ => None,
+    }
+  }
 }
 
 pub trait IntoKey {
@@ -122,12 +216,30 @@ impl IntoKey for i64 {   // use whatever integer type StateKey::Int holds
 impl IntoKey for i32 {   // use whatever integer type StateKey::Int holds
   fn into_key(self) -> Key { Key::Int(self as i64) }
 }
+impl IntoKey for usize {
+  fn into_key(self) -> Key { Key::Int(self as i64) }
+}
 
 pub trait IntoValue {
   fn into_value(self) -> Value;
 }
 impl IntoValue for Value {
   fn into_value(self) -> Value { self }
+}
+impl IntoValue for Arc<Dict> {
+  fn into_value(self) -> Value { Value::Dict(self) }
+}
+impl IntoValue for &Arc<Dict> {
+  fn into_value(self) -> Value { Value::Dict(self.clone()) }
+}
+impl IntoValue for Arc<List> {
+  fn into_value(self) -> Value { Value::List(self) }
+}
+impl IntoValue for &Arc<List> {
+  fn into_value(self) -> Value { Value::List(self.clone()) }
+}
+impl IntoValue for Json {
+  fn into_value(self) -> Value { Value::from_json(&self) }
 }
 impl IntoValue for &str {
   fn into_value(self) -> Value { Value::String(self.to_string()) }
@@ -207,6 +319,17 @@ impl TryFrom<Value> for u32 {
   }
 }
 
+impl TryFrom<Value> for bool {
+  type Error = Value;
+
+  fn try_from(value: Value) -> Result<Self, Self::Error> {
+    match value {
+      Value::Bool(b) => Ok(b),
+      other => Err(other),
+    }
+  }
+}
+
 impl TryFrom<Value> for String {
   type Error = Value;
 
@@ -218,97 +341,410 @@ impl TryFrom<Value> for String {
   }
 }
 
-static NEXT_ID: Mutex<u64> = Mutex::new(0 as u64);
+impl TryFrom<Value> for Arc<Dict> {
+  type Error = Value;
 
-fn get_id() -> u64 {
-  let mut lock = NEXT_ID.lock();
-  let id = *lock;
-  *lock += 1;
-  id
+  fn try_from(value: Value) -> Result<Self, Self::Error> {
+    match value {
+      Value::Dict(d) => Ok(d),
+      other => Err(other),
+    }
+  }
 }
 
-type RemoteStorage = Rc<dyn Fn(Action, &str, Value, Box<dyn FnOnce()>)>;
+impl TryFrom<Value> for Arc<List> {
+  type Error = Value;
+
+  fn try_from(value: Value) -> Result<Self, Self::Error> {
+    match value {
+      Value::List(l) => Ok(l),
+      other => Err(other),
+    }
+  }
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn get_id() -> u64 {
+  NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+type Callback = Box<dyn FnOnce() + Send>;
+/// The node that changed, the action, and the key and value it applied to.
+pub type ObserverFn = dyn Fn(&Coll, Action, &Key, &Value) + Send + Sync;
+/// `connected` is cleared by the [`OnDrop`] from [`Dict::connect`].
+/// Clearing a flag rather than removing the entry means dropping the
+/// `OnDrop` never takes a lock or frees the closure itself, so it's safe
+/// anywhere, including inside an observer or while the node is locked.
+/// Disconnected observers are pruned, and freed, by the next notify.
+#[derive(Clone)]
+struct Observer {
+  connected: Arc<AtomicBool>,
+  callback: Arc<ObserverFn>,
+}
+pub type RemoteStorage = Arc<dyn Fn(Action, &str, Value, Callback) + Send + Sync>;
+
+#[derive(Clone)]
+enum WeakColl {
+  Dict(Weak<Dict>),
+  List(Weak<List>),
+}
+
+impl WeakColl {
+  fn upgrade(&self) -> Option<Coll> {
+    match self {
+      WeakColl::Dict(d) => {
+        if let Some(d) = d.upgrade() {
+          Some(Coll::Dict(d))
+        } else {
+          None
+        }
+      },
+      WeakColl::List(d) => {
+        if let Some(d) = d.upgrade() {
+          Some(Coll::List(d))
+        } else {
+          None
+        }
+      },
+    }
+  }
+}
+
+struct DictInner {
+  content: HashMap<Key, Value>,
+  observers: Vec<Observer>,
+  remote_storage: Option<RemoteStorage>,
+  parent: WeakColl,
+}
+
+struct ListInner {
+  content: Vec<Value>,
+  observers: Vec<Observer>,
+  remote_storage: Option<RemoteStorage>,
+  parent: WeakColl,
+}
 
 pub struct Dict {
-  content: HashMap<Key, Value>,
   id: u64,
-  observers: Arc<Mutex<Vec<(u64, Rc<dyn Fn(&Rc<Collection>, Action, &Key, &Value)>)>>>,
-  remote_storage: Option<RemoteStorage>,
-  parent: Weak<Collection>,
+  inner: Mutex<DictInner>,
 }
 
 pub struct List {
-  content: Vec<Value>,
   id: u64,
-  observers: Arc<Mutex<Vec<(u64, Rc<dyn Fn(&Rc<Collection>, Action, &Key, &Value)>)>>>,
-  remote_storage: Option<RemoteStorage>,
-  parent: Weak<Collection>,
+  inner: Mutex<ListInner>,
 }
 
-pub enum Collection {
-  Dict(RefCell<Dict>),
-  List(RefCell<List>),
+impl Dict {
+  pub fn new() -> Arc<Dict> {
+    Arc::new(Dict {
+      id: get_id(),
+      inner: Mutex::new(DictInner { 
+        content: HashMap::new(), 
+        observers: vec![], 
+        remote_storage: None, 
+        parent: WeakColl::Dict(Weak::new())
+      })
+    })
+  }
+
+  fn as_value(self: &Arc<Self>) -> Value {
+    Coll::Dict(self.clone()).as_value()
+  }
+
+  pub fn len(self: &Arc<Self>) -> usize {
+    Coll::Dict(self.clone()).len()
+  }
+
+  /// A snapshot of the contents.
+  pub fn entries(self: &Arc<Self>) -> Vec<(Key, Value)> {
+    Coll::Dict(self.clone()).entries()
+  }
+
+  /// A deep conversion to plain JSON.
+  pub fn to_json(self: &Arc<Self>) -> Json {
+    Coll::Dict(self.clone()).to_json()
+  }
+
+  fn parent(self: &Arc<Self>) -> WeakColl {
+    Coll::Dict(self.clone()).parent()
+  }
+
+  fn key_of(self: &Arc<Self>, value: &Value) -> Option<Key> {
+    Coll::Dict(self.clone()).key_of(value)
+  }
+
+  pub fn set_remote_storage(self: &Arc<Self>, storage: Option<RemoteStorage>) {
+    Coll::Dict(self.clone()).set_remote_storage(storage)
+  }
+
+  /// Calls `callback` for every change to this node or any descendant,
+  /// with the node that changed, until the returned [`OnDrop`] is dropped.
+  pub fn connect<F: Fn(&Coll, Action, &Key, &Value) + Send + Sync + 'static>(
+    self: &Arc<Self>,
+    callback: F,
+  ) -> OnDrop {
+    Coll::Dict(self.clone()).connect(callback)
+  }
+
+  pub fn set(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue) {
+    Coll::Dict(self.clone()).set(key, value)
+  }
+
+  pub fn set_with(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce() + Send + 'static) {
+    Coll::Dict(self.clone()).set_with(key, value, callback)
+  }
+
+  pub fn set_direct(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce()) {
+    Coll::Dict(self.clone()).set_direct(key, value, callback)
+  }
+
+  pub fn remove(self: &Arc<Self>, key: impl IntoKey) {
+    Coll::Dict(self.clone()).remove(key)
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  pub fn remove_with(self: &Arc<Self>, key: impl IntoKey, callback: impl FnOnce() + Send + 'static) {
+    Coll::Dict(self.clone()).remove_with(key, callback)
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  pub fn remove_direct(self: &Arc<Self>, key: impl IntoKey, callback: impl FnOnce()) {
+    Coll::Dict(self.clone()).remove_direct(key, callback)
+  }
+
+  /// Removes everything, last entry first so list indices stay valid.
+  pub fn clear_direct(self: &Arc<Self>) {
+    Coll::Dict(self.clone()).clear_direct()
+  }
+
+  pub fn assign_json(self: &Arc<Self>, json: &Json) -> anyhow::Result<()> {
+    Coll::Dict(self.clone()).assign_json(json)
+  }
+
+  fn assign_entries(self: &Arc<Self>, entries: Vec<(Key, Value)>) {
+    Coll::Dict(self.clone()).assign_entries(entries)
+  }
+
+  pub fn get(self: &Arc<Self>, key: impl IntoKey) -> Option<Value> {
+    Coll::Dict(self.clone()).get(key)
+  }
+
+  pub fn contains_key(self: &Arc<Self>, key: impl IntoKey) -> bool {
+    Coll::Dict(self.clone()).contains_key(key)
+  }
+}
+
+impl List {
+  pub fn new() -> Arc<List> {
+    Arc::new(List {
+      id: get_id(),
+      inner: Mutex::new(ListInner { 
+        content: vec![], 
+        observers: vec![], 
+        remote_storage: None, 
+        parent: WeakColl::Dict(Weak::new())
+      })
+    })
+  }
+
+  fn as_value(self: &Arc<Self>) -> Value {
+    Coll::List(self.clone()).as_value()
+  }
+
+  pub fn len(self: &Arc<Self>) -> usize {
+    Coll::List(self.clone()).len()
+  }
+
+  /// A snapshot of the contents.
+  pub fn entries(self: &Arc<Self>) -> Vec<(Key, Value)> {
+    Coll::List(self.clone()).entries()
+  }
+
+  /// A deep conversion to plain JSON.
+  pub fn to_json(self: &Arc<Self>) -> Json {
+    Coll::List(self.clone()).to_json()
+  }
+
+  fn parent(self: &Arc<Self>) -> WeakColl {
+    Coll::List(self.clone()).parent()
+  }
+
+  fn key_of(self: &Arc<Self>, value: &Value) -> Option<Key> {
+    Coll::List(self.clone()).key_of(value)
+  }
+
+  pub fn set_remote_storage(self: &Arc<Self>, storage: Option<RemoteStorage>) {
+    Coll::List(self.clone()).set_remote_storage(storage)
+  }
+
+  /// Calls `callback` for every change to this node or any descendant,
+  /// with the node that changed, until the returned [`OnDrop`] is dropped.
+  pub fn connect<F: Fn(&Coll, Action, &Key, &Value) + Send + Sync + 'static>(
+    self: &Arc<Self>,
+    callback: F,
+  ) -> OnDrop {
+    Coll::List(self.clone()).connect(callback)
+  }
+
+  pub fn push(self: &Arc<Self>, value: impl IntoValue) {
+    Coll::List(self.clone()).push(value)
+  }
+
+  pub fn push_with(self: &Arc<Self>, value: impl IntoValue, callback: impl FnOnce() + Send + 'static) {
+    Coll::List(self.clone()).push_with(value, callback)
+  }
+
+  pub fn push_direct(self: &Arc<Self>, value: impl IntoValue, callback: impl FnOnce()) {
+    Coll::List(self.clone()).push_direct(value, callback)
+  }
+
+  pub fn set(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue) {
+    Coll::List(self.clone()).set(key, value)
+  }
+
+  pub fn set_with(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce() + Send + 'static) {
+    Coll::List(self.clone()).set_with(key, value, callback)
+  }
+
+  pub fn set_direct(self: &Arc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce()) {
+    Coll::List(self.clone()).set_direct(key, value, callback)
+  }
+
+  pub fn remove(self: &Arc<Self>, key: impl IntoKey) {
+    Coll::List(self.clone()).remove(key)
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  pub fn remove_with(self: &Arc<Self>, key: impl IntoKey, callback: impl FnOnce() + Send + 'static) {
+    Coll::List(self.clone()).remove_with(key, callback)
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  pub fn remove_direct(self: &Arc<Self>, key: impl IntoKey, callback: impl FnOnce()) {
+    Coll::List(self.clone()).remove_direct(key, callback)
+  }
+
+  /// Removes everything, last entry first so list indices stay valid.
+  pub fn clear_direct(self: &Arc<Self>) {
+    Coll::List(self.clone()).clear_direct()
+  }
+
+  pub fn assign_json(self: &Arc<Self>, json: &Json) -> anyhow::Result<()> {
+    Coll::List(self.clone()).assign_json(json)
+  }
+
+  fn assign_entries(self: &Arc<Self>, entries: Vec<(Key, Value)>) {
+    Coll::List(self.clone()).assign_entries(entries)
+  }
+
+  pub fn get(self: &Arc<Self>, key: impl IntoKey) -> Option<Value> {
+    Coll::List(self.clone()).get(key)
+  }
+
+  pub fn contains_key(self: &Arc<Self>, key: impl IntoKey) -> bool {
+    Coll::List(self.clone()).contains_key(key)
+  }
+}
+
+// The contents are copied out before formatting, since formatting them
+// formats (and so locks) the child nodes.
+impl std::fmt::Debug for List {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let content = self.inner.lock().content.clone();
+    f.debug_tuple("List").field(&self.id).field(&content).finish()
+  }
+}
+impl PartialEq for List {
+  fn eq(&self, other: &Self) -> bool {
+    self.id == other.id
+  }
+}
+
+impl std::fmt::Debug for Dict {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let content = self.inner.lock().content.clone();
+    f.debug_tuple("Dict").field(&self.id).field(&content).finish()
+  }
+}
+impl PartialEq for Dict {
+  fn eq(&self, other: &Self) -> bool {
+    self.id == other.id
+  }
+}
+
+/// Either kind of node. Outside this module it's only for matching on, to get
+/// the [`Dict`] or [`List`]: its methods are private, the implementation the
+/// two share. See the module docs for the locking rule.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Coll {
+  Dict(Arc<Dict>),
+  List(Arc<List>),
 }
 
 macro_rules! on_content {
   ($coll:expr, $content:ident => $body:expr) => {
     match $coll {
-      Collection::Dict($content) => $body,
-      Collection::List($content) => $body,
+      Coll::Dict($content) => $body,
+      Coll::List($content) => $body,
     }
   };
 }
 
-impl PartialEq for Collection {
-  fn eq(&self, other: &Self) -> bool {
-    let l = on_content!(self, c => c.borrow().id);
-    let r = on_content!(other, c => c.borrow().id);
-    l == r
-  }
-}
-
-impl std::fmt::Debug for Collection {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Coll {
+  fn as_value(&self) -> Value {
     match self {
-      Self::Dict(c) => {
-        let c = c.borrow();
-        f.debug_tuple("Dict").field(&c.id).field(&c.content).finish()
-      }
-      Self::List(c) => {
-        let c = c.borrow();
-        f.debug_tuple("List").field(&c.id).field(&c.content).finish()
-      }
+      Coll::Dict(d) => Value::Dict(d.clone()),
+      Coll::List(d) => Value::List(d.clone()),
     }
   }
-}
 
-impl Collection {
+  fn is_dict(&self) -> bool {
+    matches!(self, Coll::Dict(_))
+  }
+
+  fn is_list(&self) -> bool {
+    matches!(self, Coll::List(_))
+  }
+
+  fn len(&self) -> usize {
+    on_content!(self, c => c.inner.lock().content.len())
+  }
+
   fn entries(&self) -> Vec<(Key, Value)> {
     match self {
-      Collection::Dict(c) => { 
-        c.borrow().content.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+      Coll::Dict(c) => {
+        c.inner.lock().content.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
       },
-      Collection::List(c) => { 
-        c.borrow().content.iter().enumerate().map(|(k, v)| (Key::Int(k as i64), v.clone())).collect()
+      Coll::List(c) => {
+        c.inner.lock().content.iter().enumerate().map(|(k, v)| (Key::Int(k as i64), v.clone())).collect()
       },
     }
   }
 
-  fn parent(&self) -> Weak<Collection> {
-    on_content!(self, c => c.borrow().parent.clone())
+  /// A deep conversion to plain JSON. Integer dict keys become strings.
+  fn to_json(&self) -> Json {
+    let entries = self.entries();
+    if self.is_dict() {
+      Json::Object(
+        entries
+          .into_iter()
+          .map(|(key, value)| {
+            let key = match key {
+              Key::String(s) => s,
+              Key::Int(i) => i.to_string(),
+            };
+            (key, value.to_json())
+          })
+          .collect(),
+      )
+    } else {
+      Json::Array(entries.into_iter().map(|(_, value)| value.to_json()).collect())
+    }
   }
 
-  fn address(self: &Rc<Self>) -> String {
-    let (prefix, end_opt) = match self.parent().upgrade().as_ref() {
-      Some(parent) => (parent.address(), parent.key_of(&Value::Coll(self.clone()))),
-      None => return "".to_string()
-    };
-
-    match end_opt {
-      Some(Key::Int(i)) => format!("{prefix}[{i}]"),
-      Some(Key::String(i)) => format!("{prefix}['{i}']"),
-      None => panic!("Failed to find self in parent collection")
-    }
+  fn parent(&self) -> WeakColl {
+    on_content!(self, c => c.inner.lock().parent.clone())
   }
 
   fn key_of(&self, value: &Value) -> Option<Key> {
@@ -321,101 +757,165 @@ impl Collection {
     None
   }
 
-  fn find_remote_storage(self: &Rc<Self>) -> Option<RemoteStorage> {
-    on_content!(&**self, c => {
-      match c.borrow().remote_storage.as_ref() {
-        Some(r) => {
-          Some(r.clone())
-        }
-        None => {
-          match self.parent().upgrade().as_ref() {
-            Some(parent) => parent.find_remote_storage(),
-            None => None
-          }
-        }
-      }
-    })
-  }
-
-  fn connect<F: Fn(&Rc<Collection>, Action, &Key, &Value) + 'static>(
-    self: &Rc<Self>,
-    callback: F,
-  ) -> OnDrop {
-    let id = get_id();
-    let weak = on_content!(&**self, c => {
-      let c = c.borrow();
-      c.observers.lock().push((id, Rc::new(callback)));
-      Arc::downgrade(&c.observers)
-    });
-    OnDrop::new(move || {
-      if let Some(this) = weak.upgrade() {
-        this.lock().retain(|(i, _)| *i != id)
-      }
-    })
-  }
-
-  fn claim(self: &Rc<Self>, child: &Value) {
-    match child {
-      Value::Coll(c) => {
-        on_content!(&**c, c2 => {
-          let mut c2 = c2.borrow_mut();
-          c2.parent = Rc::downgrade(self);
-          c2.remote_storage = None;
-        })
+  fn downgrade(&self) -> WeakColl {
+    match self {
+      Coll::Dict(d) => {
+        WeakColl::Dict(Arc::downgrade(d))
       },
-      _ => {}
+      Coll::List(d) => {
+        WeakColl::List(Arc::downgrade(d))
+      },
     }
   }
 
-  pub fn push(self: &Rc<Self>, value: impl IntoValue) {
+  /// Sets (or with `None`, clears) the remote storage that writes to this
+  /// node and its descendants go through.
+  fn set_remote_storage(&self, storage: Option<RemoteStorage>) {
+    on_content!(self, c => c.inner.lock().remote_storage = storage)
+  }
+
+  /// Where a write to `key` here should go instead of being applied: the
+  /// remote storage in effect (this node's own, else its nearest ancestor's)
+  /// and the address of `key` relative to the node that storage is on.
+  /// Found in one walk up the tree, so a node being detached concurrently
+  /// can't produce a wrong address: if it's no longer in its parent, this is
+  /// `None` and the write applies locally, as it would to any detached node.
+  fn remote_target(&self, key: &Key) -> Option<(RemoteStorage, String)> {
+    let mut segments = vec![key.address_segment()];
+    let mut current = self.clone();
+    loop {
+      let (storage, parent) = on_content!(&current, c => {
+        let inner = c.inner.lock();
+        (inner.remote_storage.clone(), inner.parent.upgrade())
+      });
+      if let Some(storage) = storage {
+        segments.reverse();
+        return Some((storage, segments.concat()));
+      }
+      let parent = parent?;
+      segments.push(parent.key_of(&current.as_value())?.address_segment());
+      current = parent;
+    }
+  }
+
+  fn connect<F: Fn(&Coll, Action, &Key, &Value) + Send + Sync + 'static>(
+    &self,
+    callback: F,
+  ) -> OnDrop {
+    let connected = Arc::new(AtomicBool::new(true));
+    let observer = Observer {
+      connected: connected.clone(),
+      callback: Arc::new(callback),
+    };
+    on_content!(self, c => c.inner.lock().observers.push(observer));
+    OnDrop::new(move || connected.store(false, Ordering::Relaxed))
+  }
+
+  /// Calls the connected observers of this node, then of each ancestor in
+  /// turn, passing this node as the one that changed.
+  fn notify(&self, action: Action, key: &Key, value: &Value) {
+    let mut current = Some(self.clone());
+    while let Some(node) = current {
+      for observer in node.connected_observers() {
+        // Checked again in case an earlier observer disconnected this one.
+        if observer.connected.load(Ordering::Relaxed) {
+          (observer.callback)(self, action, key, value);
+        }
+      }
+      current = node.parent().upgrade();
+    }
+  }
+
+  /// This node's own connected observers. Disconnected ones are removed
+  /// under the same lock (so a concurrent `connect` can't be lost), but
+  /// freed only after it's released, since dropping a closure runs whatever
+  /// `Drop` code it captured.
+  fn connected_observers(&self) -> Vec<Observer> {
+    let (connected, _disconnected) = on_content!(self, c => {
+      let mut c = c.inner.lock();
+      let (connected, disconnected): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut c.observers).into_iter().partition(|o| o.connected.load(Ordering::Relaxed));
+      c.observers = connected.clone();
+      (connected, disconnected)
+    });
+    connected
+  }
+
+  /// Makes this node `child`'s parent, if `child` is a node. Panics if it's
+  /// this node or one of its ancestors, as that would make a cycle: a leak,
+  /// and notifications that never stop climbing.
+  fn claim(&self, child: &Value) {
+    let Some(child_coll) = child.as_coll() else {
+      return;
+    };
+
+    let mut ancestor = Some(self.clone());
+    while let Some(node) = ancestor {
+      assert!(node != child_coll, "Inserting a collection into itself or one of its descendants");
+      ancestor = node.parent().upgrade();
+    }
+
+    on_content!(child_coll, c => {
+      let mut c = c.inner.lock();
+      c.parent = self.downgrade();
+      c.remote_storage = None;
+    })
+  }
+
+  /// Undoes `claim` for a value that's been removed or replaced.
+  fn release(child: &Value) {
+    let Some(child_coll) = child.as_coll() else {
+      return;
+    };
+    
+    on_content!(child_coll, c => {
+      let mut c = c.inner.lock();
+      c.parent = WeakColl::Dict(Weak::new());
+      c.remote_storage = None;
+    })
+  }
+
+  fn push(&self, value: impl IntoValue) {
     self.push_with(value, ||{});
   }
 
-  pub fn push_with(self: &Rc<Self>, value: impl IntoValue, callback: impl FnOnce() + 'static) {
-    match &**self {
-      Collection::List(c) => {
-        let c = c.borrow();
-        if let Some(remote_storage) = c.remote_storage.as_ref() {
-          let address = self.address();
-          let index = c.content.len();
-          let total_address = format!("{address}[{index}]");
-          remote_storage(Action::Set, &total_address, value.into_value(), Box::new(callback));
-          return;
-        }
-      },
-      Collection::Dict(_) => panic!("Cannot push into dict"),
+  fn push_with(&self, value: impl IntoValue, callback: impl FnOnce() + Send + 'static) {
+    if self.is_dict() {
+      panic!("Cannot push into dict");
+    }
+
+    if let Some((remote_storage, address)) = self.remote_target(&Key::Int(self.len() as i64)) {
+      remote_storage(Action::Set, &address, value.into_value(), Box::new(callback));
+      return;
     }
 
     self.push_direct(value, callback);
   }
 
-  pub fn push_direct(self: &Rc<Self>, value: impl IntoValue, callback: impl FnOnce()) {
+  fn push_direct(&self, value: impl IntoValue, callback: impl FnOnce()) {
     let value = value.into_value();
     self.claim(&value);
 
-    let (index, observers) = match &**self {
-      Collection::List(c) => {
-        let mut c = c.borrow_mut();
+    let index = match self {
+      Coll::List(c) => {
+        let mut c = c.inner.lock();
 
         let index = Key::Int(c.content.len() as i64);
         c.content.push(value.clone());
-
-        (index, c.observers.lock().clone())
+        index
       },
-      Collection::Dict(_) => panic!("Cannot push into dict"),
+      Coll::Dict(_) => panic!("Cannot push into dict"),
     };
 
-    for (_, o) in observers {
-      o(self, Action::Set, &index, &value);
-    }
+    self.notify(Action::Set, &index, &value);
     callback();
   }
 
-  pub fn set(self: &Rc<Self>, key: impl IntoKey, value: impl IntoValue) {
+  fn set(&self, key: impl IntoKey, value: impl IntoValue) {
     self.set_with(key, value, ||{});
   }
 
-  pub fn set_with(self: &Rc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce() + 'static) {
+  fn set_with(&self, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce() + Send + 'static) {
     let key = key.into_key();
     let value = value.into_value();
     if self.get(key.clone()) == Some(value.clone()) {
@@ -423,24 +923,15 @@ impl Collection {
       return;
     }
 
-    on_content!(&**self, c => {
-      let c = c.borrow();
-      if let Some(remote_storage) = c.remote_storage.as_ref() {
-        let address = self.address();
-        let index = match &key {
-          Key::Int(i) => format!("[{i}]"),
-          Key::String(i) => format!("['{i}']"),
-        };
-        let total_address = format!("{address}{index}");
-        remote_storage(Action::Set, &total_address, value.into_value(), Box::new(callback));
-        return;
-      }
-    });
+    if let Some((remote_storage, address)) = self.remote_target(&key) {
+      remote_storage(Action::Set, &address, value, Box::new(callback));
+      return;
+    }
 
     self.set_direct(key, value, callback);
   }
 
-  pub fn set_direct(self: &Rc<Self>, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce() + 'static) {
+  fn set_direct(&self, key: impl IntoKey, value: impl IntoValue, callback: impl FnOnce()) {
     let key = key.into_key();
     let value = value.into_value();
     if self.get(key.clone()) == Some(value.clone()) {
@@ -449,9 +940,9 @@ impl Collection {
     }
     self.claim(&value);
 
-    let observers = match &**self {
-      Collection::List(c) => {
-        let mut c = c.borrow_mut();
+    let replaced = match self {
+      Coll::List(c) => {
+        let mut c = c.inner.lock();
 
         match key {
           Key::Int(i) => {
@@ -459,52 +950,122 @@ impl Collection {
             let len = c.content.len();
             if i == len {
               c.content.push(value.clone());
+              None
             } else if i < len {
-              c.content[i] = value.clone();
+              Some(std::mem::replace(&mut c.content[i], value.clone()))
             } else {
               panic!("Index out of bounds: i = {i}, len = {len}");
             }
           },
-          other => panic!("Index List with non integer: {:?}", other),
+          ref other => panic!("Index List with non integer: {:?}", other),
         }
-
-        c.observers.lock().clone()
       },
-      Collection::Dict(c) => {
-        let mut c = c.borrow_mut();
-
-        c.content.insert(key.clone(), value.clone());
-
-        c.observers.lock().clone()
-      },
+      Coll::Dict(c) => c.inner.lock().content.insert(key.clone(), value.clone()),
     };
 
-    for (_, o) in observers {
-      o(self, Action::Set, &key, &value);
+    if let Some(replaced) = replaced {
+      Self::release(&replaced);
     }
+    self.notify(Action::Set, &key, &value);
     callback();
   }
 
-  pub fn get(&self, key: impl IntoKey) -> Option<Value> {
+  fn remove(&self, key: impl IntoKey) {
+    self.remove_with(key, ||{});
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  fn remove_with(&self, key: impl IntoKey, callback: impl FnOnce() + Send + 'static) {
     let key = key.into_key();
-    match self {
-      Collection::List(c) => {
-        let c = c.borrow_mut();
-        match key {
-          Key::Int(i) => {
-            Some(c.content[i as usize].clone())
-          },
-          other => panic!("Attempted to index list with non integer {:?}", other),
+    let Some(current) = self.get(key.clone()) else {
+      return;
+    };
+
+    if let Some((remote_storage, address)) = self.remote_target(&key) {
+      remote_storage(Action::Delete, &address, current, Box::new(callback));
+      return;
+    }
+
+    self.remove_direct(key, callback);
+  }
+
+  /// Does nothing, the callback included, if there's nothing at `key`.
+  fn remove_direct(&self, key: impl IntoKey, callback: impl FnOnce()) {
+    let key = key.into_key();
+    let removed = match self {
+      Coll::List(c) => {
+        let mut c = c.inner.lock();
+        match key.list_index() {
+          Some(i) if i < c.content.len() => Some(c.content.remove(i)),
+          _ => None,
         }
       },
-      Collection::Dict(c) => {
-        let c = c.borrow_mut();
-        c.content.get(&key).map(|v| v.clone())
-      },
+      Coll::Dict(c) => c.inner.lock().content.remove(&key),
+    };
+    let Some(removed) = removed else {
+      return;
+    };
+
+    Self::release(&removed);
+    self.notify(Action::Delete, &key, &removed);
+    callback();
+  }
+
+  /// Removes everything, last entry first so list indices stay valid.
+  fn clear_direct(&self) {
+    for (key, _) in self.entries().into_iter().rev() {
+      self.remove_direct(key, ||{});
     }
   }
 
-  pub fn contains_key(&self, key: impl IntoKey) -> bool {
+  /// Makes this node's contents equal to `json`, which must be an object
+  /// for a dict and an array for a list. Collections of the same kind
+  /// present on both sides are assigned into recursively, keeping them and
+  /// their observers; everything else is replaced or removed.
+  fn assign_json(&self, json: &Json) -> anyhow::Result<()> {
+    let Some(source) = Value::from_json(json).as_coll() else {
+      anyhow::bail!("can't assign {json} to a collection");
+    };
+    if source.is_dict() != self.is_dict() {
+      anyhow::bail!("can't assign {json} to a {}", if self.is_dict() { "dict" } else { "list" });
+    }
+    self.assign_entries(source.entries());
+    Ok(())
+  }
+
+  fn assign_entries(&self, entries: Vec<(Key, Value)>) {
+    let mut missing: Vec<Key> = self.entries().into_iter().map(|(key, _)| key).collect();
+    for (key, value) in entries {
+      missing.retain(|k| *k != key);
+      match (&value, self.get(key.clone())) {
+        (Value::Dict(source), Some(Value::Dict(dest))) => {
+          Coll::Dict(dest).assign_entries(Coll::Dict(source.clone()).entries());
+        },
+        (Value::List(source), Some(Value::List(dest))) => {
+          Coll::List(dest).assign_entries(Coll::List(source.clone()).entries());
+        },
+        _ => self.set_direct(key, value, ||{}),
+      }
+    }
+    for key in missing.into_iter().rev() {
+      self.remove_direct(key, ||{});
+    }
+  }
+
+  /// `None` if there's nothing at `key`, including a key of the wrong type
+  /// for this collection.
+  fn get(&self, key: impl IntoKey) -> Option<Value> {
+    let key = key.into_key();
+    match self {
+      Coll::List(c) => {
+        let c = c.inner.lock();
+        key.list_index().and_then(|i| c.content.get(i).cloned())
+      },
+      Coll::Dict(c) => c.inner.lock().content.get(&key).cloned(),
+    }
+  }
+
+  fn contains_key(&self, key: impl IntoKey) -> bool {
     self.get(key).is_some()
   }
 }

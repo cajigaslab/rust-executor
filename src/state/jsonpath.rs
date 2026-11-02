@@ -23,11 +23,12 @@
 //! end, and `<`/`>` (which C++ parses but never matches).
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value as Json;
 
-use super::{State, StateKey, StateValue};
+use super::{Dict, Key, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Segment {
@@ -318,21 +319,21 @@ fn parse(query: &str) -> Result<Vec<Segment>> {
 }
 
 /// The child of `current` that `segment` selects, with its key.
-fn select(current: &StateValue, segment: &Segment, root: &StateValue) -> Option<(StateKey, StateValue)> {
-  let state = current.as_state()?;
+fn select(current: &Value, segment: &Segment, root: &Value) -> Option<(Key, Value)> {
+  let state = current.as_coll()?;
   match segment {
     Segment::Name(name) => {
-      let key = StateKey::String(name.clone());
+      let key = Key::String(name.clone());
       state.get(key.clone()).map(|value| (key, value))
     }
     Segment::Index(index) => {
       if state.is_list() {
         let index = if *index < 0 { state.len() as i64 + index } else { *index };
-        let key = StateKey::Int(index);
+        let key = Key::Int(index);
         state.get(key.clone()).map(|value| (key, value))
       } else {
         // C++ dicts can hold integer keys; JSON-sourced ones only have strings.
-        [StateKey::Int(*index), StateKey::String(index.to_string())]
+        [Key::Int(*index), Key::String(index.to_string())]
           .into_iter()
           .find_map(|key| state.get(key.clone()).map(|value| (key, value)))
       }
@@ -345,50 +346,54 @@ fn select(current: &StateValue, segment: &Segment, root: &StateValue) -> Option<
 }
 
 /// Follows `segments` from `start`; `Null` if any step finds nothing.
-fn resolve(root: &StateValue, start: &StateValue, segments: &[Segment]) -> StateValue {
+fn resolve(root: &Value, start: &Value, segments: &[Segment]) -> Value {
   let mut current = start.clone();
   for segment in segments {
     match select(&current, segment, root) {
       Some((_, value)) => current = value,
-      None => return StateValue::Null,
+      None => return Value::Null,
     }
   }
   current
 }
 
-fn matches_filter(filter: &[Vec<Comparison>], current: &StateValue, root: &StateValue) -> bool {
+fn matches_filter(filter: &[Vec<Comparison>], current: &Value, root: &Value) -> bool {
   filter
     .iter()
     .any(|conjunction| conjunction.iter().all(|comparison| compare(comparison, current, root)))
 }
 
-fn operand_value(operand: &Operand, current: &StateValue, root: &StateValue) -> StateValue {
+fn operand_value(operand: &Operand, current: &Value, root: &Value) -> Value {
   match operand {
-    Operand::Literal(json) => StateValue::from_json(json),
+    Operand::Literal(json) => Value::from_json(json),
     Operand::Query { absolute, segments } => resolve(root, if *absolute { root } else { current }, segments),
   }
 }
 
-fn as_number(value: &StateValue) -> Option<f64> {
+fn as_number(value: &Value) -> Option<f64> {
   match value {
-    StateValue::Int(i) => Some(*i as f64),
-    StateValue::Float(f) => Some(*f),
+    Value::Int(i) => Some(*i as f64),
+    Value::Float(f) => Some(*f),
     _ => None,
   }
 }
 
-fn order(lhs: &StateValue, rhs: &StateValue) -> Option<Ordering> {
+fn order(lhs: &Value, rhs: &Value) -> Option<Ordering> {
   match (lhs, rhs) {
-    (StateValue::String(l), StateValue::String(r)) => Some(l.cmp(r)),
+    (Value::String(l), Value::String(r)) => Some(l.cmp(r)),
+    // Exact, as large ints would round as f64.
+    (Value::Int(l), Value::Int(r)) => Some(l.cmp(r)),
     _ => as_number(lhs)?.partial_cmp(&as_number(rhs)?),
   }
 }
 
-fn compare(comparison: &Comparison, current: &StateValue, root: &StateValue) -> bool {
+fn compare(comparison: &Comparison, current: &Value, root: &Value) -> bool {
   let lhs = operand_value(&comparison.lhs, current, root);
   let rhs = operand_value(&comparison.rhs, current, root);
-  // Ints and floats compare numerically (`1 == 1.0`).
+  // Ints and floats compare numerically (`1 == 1.0`), but two ints compare
+  // exactly, as large ones would round as f64.
   let equal = match (as_number(&lhs), as_number(&rhs)) {
+    _ if matches!((&lhs, &rhs), (Value::Int(_), Value::Int(_))) => lhs == rhs,
     (Some(l), Some(r)) => l == r,
     _ => lhs == rhs,
   };
@@ -403,34 +408,36 @@ fn compare(comparison: &Comparison, current: &StateValue, root: &StateValue) -> 
 }
 
 /// The value at `query` under `root`, or `Null` if there's nothing there.
-pub fn get_jsonpath(root: &State, query: &str) -> Result<StateValue> {
+pub fn get_jsonpath(root: &Arc<Dict>, query: &str) -> Result<Value> {
   let segments = parse(query)?;
-  let root = root.as_value();
+  let root = Value::Dict(root.clone());
   Ok(resolve(&root, &root, &segments))
 }
 
-/// Sets `value` at `query` under `root`. If a collection of the same kind
+/// Sets `value` at `query` under `root`, locally (never through remote
+/// storage). If a collection of the same kind
 /// is already there it's assigned into recursively (keeping it, and its
 /// observers — Python's behavior), otherwise the value is replaced. Setting
 /// a list index past the end pads it with nulls first (C++'s behavior). An
 /// empty query assigns to `root` itself.
-pub fn set_jsonpath(root: &State, query: &str, value: &Json, from_remote: bool) -> Result<()> {
+pub fn set_jsonpath(root: &Arc<Dict>, query: &str, value: &Json) -> Result<()> {
   let segments = parse(query)?;
   let Some((last, parents)) = segments.split_last() else {
-    return root.assign_json_with(value, None, from_remote);
+    return root.assign_json(value);
   };
 
-  let root_value = root.as_value();
+  let root_value = Value::Dict(root.clone());
   let parent_value = resolve(&root_value, &root_value, parents);
-  let Some(parent) = parent_value.as_state() else {
+  let Some(parent) = parent_value.as_coll() else {
     bail!("{query:?}: there's no collection to set into");
   };
 
   let existing = select(&parent_value, last, &root_value);
-  if let Some((_, StateValue::Dict(target) | StateValue::List(target))) = &existing
+  if let Some((_, existing_value)) = &existing
+    && let Some(target) = existing_value.as_coll()
     && (target.is_dict() && value.is_object() || target.is_list() && value.is_array())
   {
-    return target.assign_json_with(value, None, from_remote);
+    return target.assign_json(value);
   }
 
   let key = match (existing, last) {
@@ -439,7 +446,7 @@ pub fn set_jsonpath(root: &State, query: &str, value: &Json, from_remote: bool) 
       if parent.is_list() {
         bail!("{query:?}: can't index a list by name");
       }
-      StateKey::String(name.clone())
+      Key::String(name.clone())
     }
     (None, Segment::Index(index)) => {
       if parent.is_list() {
@@ -447,31 +454,31 @@ pub fn set_jsonpath(root: &State, query: &str, value: &Json, from_remote: bool) 
           bail!("{query:?}: index out of range");
         };
         for _ in parent.len()..index {
-          parent.push_with(StateValue::Null, None, from_remote);
+          parent.push_direct(Value::Null, ||{});
         }
       }
-      StateKey::Int(*index)
+      Key::Int(*index)
     }
     (None, Segment::Filter(_)) => bail!("{query:?}: the filter matched nothing"),
   };
-  parent.set_with(key, StateValue::from_json(value), None, from_remote);
+  parent.set_direct(key, Value::from_json(value), ||{});
   Ok(())
 }
 
-/// Removes whatever is at `query` under `root`; nothing happens if there's
+/// Removes whatever is at `query` under `root`, locally; nothing happens if there's
 /// nothing there. The root itself can't be deleted.
-pub fn delete_jsonpath(root: &State, query: &str, from_remote: bool) -> Result<()> {
+pub fn delete_jsonpath(root: &Arc<Dict>, query: &str) -> Result<()> {
   let segments = parse(query)?;
   let Some((last, parents)) = segments.split_last() else {
     bail!("can't delete the root");
   };
-  let root_value = root.as_value();
+  let root_value = Value::Dict(root.clone());
   let parent_value = resolve(&root_value, &root_value, parents);
-  let Some(parent) = parent_value.as_state() else {
+  let Some(parent) = parent_value.as_coll() else {
     return Ok(());
   };
   if let Some((key, _)) = select(&parent_value, last, &root_value) {
-    parent.remove_with(key, None, from_remote);
+    parent.remove_direct(key, ||{});
   }
   Ok(())
 }

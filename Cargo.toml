@@ -31,7 +31,6 @@ ndarray = "0.17.2"
 num-traits = "0.2.19"
 itertools = "0.15.0"
 parking_lot = "0.12.5"
-indexmap = "2"
 signals2 = "0.3.3"
 either = "1.19.0"
 

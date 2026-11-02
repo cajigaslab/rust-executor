@@ -17,7 +17,7 @@ use clap::Parser;
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
 use pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use pb::thalamus_grpc::{ObservableChange, ObservableTransaction};
-use state::{Bridge, State};
+use state::{Bridge, Dict};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -259,7 +259,7 @@ async fn run_grpc(
 /// our own writes — then refreshes the cached `AngularScaling` if the
 /// transaction touched `['eye_scaling']`.
 fn apply_transaction(
-  app_state: &State,
+  app_state: &Arc<Dict>,
   bridge: Option<&Bridge>,
   transaction: &ObservableTransaction,
   angular_scaling: &eye_tracking::SharedAngularScaling,
