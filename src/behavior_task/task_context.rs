@@ -17,7 +17,6 @@ use crate::pb::thalamus_grpc::{
 use crate::pb::task_controller_grpc::{BehavResult, UsedValues};
 use crate::pb::thalamus_grpc::NodeRequest;
 use crate::pb::thalamus_grpc::node_response::Status as NodeResponseStatus;
-use super::TaskSource;
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::state::Dict;
 
@@ -140,6 +139,14 @@ pub struct TaskContext {
 
 /// Qt's logical DPI at a scale factor of 1.
 const BASE_LOGICAL_DPI: f64 = 96.0;
+
+/// Whether `node_type` is a storage node's: `STORAGE`, or `STORAGE` followed
+/// by an integer (`STORAGE2` etc.).
+fn is_storage_type(node_type: &str) -> bool {
+  node_type
+    .strip_prefix("STORAGE")
+    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+}
 
 impl TaskContext {
   pub fn new(thalamus_client: ThalamusClient<Channel>, audio_manager: AudioManager, canvas_size: Arc<Mutex<(u32, u32)>>) -> Self {
@@ -295,18 +302,23 @@ impl TaskContext {
       .map_err(|e| anyhow::anyhow!("node_request to {name} returned invalid JSON {:?}: {e}", response.json))
   }
 
-  /// Ported from `TaskContext.save_task_source`: if a STORAGE2 node is
-  /// running, saves `source` next to the file it's recording to, as
-  /// `<that file>.<source file name>`, unless that's already there. The
-  /// path is the storage node's, so this writes to the right place only on
-  /// the machine (or a share) where that path is the recording's.
-  pub async fn save_task_source(&self, source: TaskSource) -> anyhow::Result<()> {
+  /// If a storage node (`STORAGE` or `STORAGE<integer>`) is running, saves `diff` next to the file it's
+  /// recording to, as `<that file>.diff`, unless that's already there or
+  /// `diff` is empty. Replaces Python's `save_task_source`: the executor's
+  /// commit and remote (logged every trial) plus this diff pin down the
+  /// code that ran. The path is the storage node's, so this writes to the
+  /// right place only on the machine (or a share) where that path is the
+  /// recording's.
+  pub async fn save_uncommitted_diff(&self, diff: &str) -> anyhow::Result<()> {
+    if diff.is_empty() {
+      return Ok(());
+    }
     let Some(nodes) = self.app_state.get("nodes") else {
       return Ok(());
     };
     let nodes = nodes.to_json();
     let storage = nodes.as_array().into_iter().flatten().find(|node| {
-      node.get("type").and_then(Value::as_str) == Some("STORAGE2")
+      node.get("type").and_then(Value::as_str).is_some_and(is_storage_type)
         && node.get("Running").and_then(Value::as_bool).unwrap_or(false)
     });
     let Some(storage) = storage else {
@@ -315,7 +327,7 @@ impl TaskContext {
     let name = storage
       .get("name")
       .and_then(Value::as_str)
-      .ok_or_else(|| anyhow::anyhow!("the running STORAGE2 node has no name: {storage}"))?;
+      .ok_or_else(|| anyhow::anyhow!("the running storage node has no name: {storage}"))?;
 
     let response = self.node_request(name, &serde_json::json!({"type": "get_current_file"})).await?;
     tracing::debug!("current_file {response}");
@@ -327,13 +339,13 @@ impl TaskContext {
       other => anyhow::bail!("{name}'s get_current_file returned {other}, not a file name"),
     };
 
-    let out_path = std::path::PathBuf::from(format!("{current_file}.{}", source.file_name()));
+    let out_path = std::path::PathBuf::from(format!("{current_file}.diff"));
     // `create_new`, so an existing copy is never overwritten.
     match std::fs::File::create_new(&out_path) {
       Ok(mut file) => {
         use std::io::Write;
         file
-          .write_all(source.code.as_bytes())
+          .write_all(diff.as_bytes())
           .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", out_path.display()))
       }
       Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -572,5 +584,20 @@ impl TaskContext {
 
   pub fn canvas_size(&self) -> (u32, u32) {
     *self._canvas_size.lock().unwrap()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn storage_types_are_storage_and_an_optional_integer() {
+    for t in ["STORAGE", "STORAGE2", "STORAGE10"] {
+      assert!(is_storage_type(t), "{t}");
+    }
+    for t in ["STORAGE2X", "STORAGE-1", "storage2", "ANALOG"] {
+      assert!(!is_storage_type(t), "{t}");
+    }
   }
 }

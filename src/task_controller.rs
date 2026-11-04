@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::behavior_task::{self, SharedTask, TaskContext};
+use crate::build_info;
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::pb::task_controller_grpc::{TaskConfig, TaskResult};
 use serde_json::Value;
@@ -29,9 +30,9 @@ pub fn shared_trial_counter() -> SharedTrialCounter {
 /// `main::run_grpc` and shared with `touch_screen::run`/`eye_tracking::run`,
 /// not created here.
 ///
-/// Each trial starts by logging the executor's version and commit, and
-/// saving the task's source next to the recording (see
-/// `TaskContext::save_task_source`; failing to is only a warning). A task
+/// Each trial starts by logging the executor's version, commit and remote,
+/// and saving its uncommitted changes next to the recording (see
+/// `TaskContext::save_uncommitted_diff`; failing to is only a warning). A task
 /// that returns an error or panics is reported with that error in
 /// `TaskResult.error`, which the task controller shows in an error dialog.
 ///
@@ -82,10 +83,10 @@ pub async fn run(
     let body = body_of(&config);
     let task_type = task_type_of(&body);
     println!("task_type: {task_type}");
-    println!(
-      "{}",
-      serde_json::to_string_pretty(&body).expect("config should always serialize to JSON")
-    );
+    //println!(
+    //  "{}",
+    //  serde_json::to_string_pretty(&body).expect("config should always serialize to JSON")
+    //);
 
     let result = match registry.get(&task_type) {
       Some(task) => {
@@ -105,12 +106,12 @@ pub async fn run(
         );
 
         context.begin_trial(body).await;
-        context.log(&executor_version()).await;
-        // A missing copy of the source isn't worth stopping the session for
+        context.log(&build_info::version()).await;
+        // A missing copy of the diff isn't worth stopping the session for
         // (e.g. on a machine where the recording's path doesn't exist), so
         // a failure is only warned about, here and in the Thalamus log.
-        if let Err(e) = context.save_task_source(task.source()).await {
-          let warning = format!("WARNING {task_type}: failed to save the task's source: {e:#}");
+        if let Err(e) = context.save_uncommitted_diff(build_info::UNCOMMITTED_DIFF).await {
+          let warning = format!("WARNING {task_type}: failed to save the executor's uncommitted changes: {e:#}");
           tracing::warn!("{warning}");
           context.log(&warning).await;
         }
@@ -196,16 +197,6 @@ pub async fn run(
   }
 
   Ok(())
-}
-
-/// Logged at the start of every trial.
-fn executor_version() -> String {
-  format!(
-    "EXECUTOR {} {} commit {}",
-    env!("CARGO_PKG_NAME"),
-    env!("CARGO_PKG_VERSION"),
-    env!("EXECUTOR_COMMIT")
-  )
 }
 
 /// The `TaskResult` to report for a task that finished on its own: its own

@@ -11,7 +11,7 @@ use skia_safe::{Canvas, Color4f, Paint, Rect};
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::{BehaviorTask, PointSubscription, TaskContext, TaskSource, Window, task_source, wait_for, wait_for_hold};
+use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait_for_hold};
 
 /// Bundled rather than loaded from a path at runtime: tasks are constructed
 /// once at startup (see `registry`), so a missing file would take the whole
@@ -218,10 +218,6 @@ impl SimpleTouchTask {
 
 #[async_trait]
 impl BehaviorTask for SimpleTouchTask {
-  fn source(&self) -> TaskSource {
-    task_source!()
-  }
-
   async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
     let config = context.config();
     let mut used = UsedValues::new();

@@ -1,5 +1,6 @@
 mod analog;
 mod behavior_task;
+mod build_info;
 mod canvas;
 mod eye_tracking;
 mod gfx;
@@ -249,8 +250,9 @@ async fn run_grpc(
   }
   .await;
 
-  // The stream is gone: stop routing writes to it, so they apply locally.
-  app_state.set_remote_storage(None);
+  // The stream is gone. Writes still go to the bridge, which drops them with
+  // a warning; they never fall back to applying locally.
+  bridge.close();
   result
 }
 

@@ -5,10 +5,15 @@
 //! Thalamus acknowledges it. Thalamus echoes every change it accepts back to
 //! every client, the one that sent it included, and only then acknowledges
 //! it — so by the time a callback runs, the change is in the local tree.
+//!
+//! Writes are never applied locally instead, not even once the stream is
+//! gone: a write that can't be sent is dropped, callback and all, with a
+//! warning. Silently turning remote writes into synchronous local ones when
+//! the connection fails changes behavior in ways that are hard to track down.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -22,6 +27,8 @@ use super::{Action, Callback, Dict, Value, delete_jsonpath, set_jsonpath};
 
 pub struct Bridge {
   next_id: AtomicU64,
+  /// Set by [`Self::close`] once the stream has ended.
+  closed: AtomicBool,
   /// Callbacks for sent transactions, by transaction id, until acknowledged.
   pending: Mutex<HashMap<u64, Callback>>,
   outbound: UnboundedSender<ObservableTransaction>,
@@ -32,6 +39,7 @@ impl Bridge {
   pub fn new(outbound: UnboundedSender<ObservableTransaction>) -> Arc<Bridge> {
     Arc::new(Bridge {
       next_id: AtomicU64::new(1),
+      closed: AtomicBool::new(false),
       pending: Mutex::new(HashMap::new()),
       outbound,
     })
@@ -39,32 +47,28 @@ impl Bridge {
 
   /// Makes this bridge `root`'s remote storage, so writes anywhere under it
   /// go to Thalamus instead of being applied locally (Python's
-  /// `config.set_remote_storage(self.send_change)`). If the stream has gone
-  /// away, the change is applied to `root` locally instead.
+  /// `config.set_remote_storage(self.send_change)`).
   pub fn install(self: &Arc<Self>, root: &Arc<Dict>) {
     let bridge = self.clone();
-    let weak_root = Arc::downgrade(root);
     root.set_remote_storage(Some(Arc::new(move |action, address, value, callback| {
-      let Err(callback) = bridge.send_change(action, address, &value, callback) else {
-        return;
-      };
-      let Some(root) = weak_root.upgrade() else {
-        return;
-      };
-      let result = match action {
-        Action::Set => set_jsonpath(&root, address, &value.to_json()),
-        Action::Delete => delete_jsonpath(&root, address),
-      };
-      if let Err(e) = result {
-        tracing::warn!("failed to apply {address} locally: {e}");
-      }
-      callback();
+      bridge.send_change(action, address, &value, callback);
     })));
   }
 
-  /// Python's `send_change`. If the stream has gone away, hands the callback
-  /// back.
-  fn send_change(&self, action: Action, address: &str, value: &Value, callback: Callback) -> Result<(), Callback> {
+  /// Marks the stream as ended: writes from now on are dropped with a
+  /// warning, rather than queued for a stream nobody reads.
+  pub fn close(&self) {
+    self.closed.store(true, Ordering::Relaxed);
+    self.pending.lock().clear();
+  }
+
+  /// Python's `send_change`. If the stream has gone away, the change and its
+  /// callback are dropped with a warning.
+  fn send_change(&self, action: Action, address: &str, value: &Value, callback: Callback) {
+    if self.closed.load(Ordering::Relaxed) {
+      tracing::warn!("observable_bridge_v2 stream has ended; dropping the change to {address}");
+      return;
+    }
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
     self.pending.lock().insert(id, callback);
     let transaction = ObservableTransaction {
@@ -81,10 +85,9 @@ impl Bridge {
       ..Default::default()
     };
     if self.outbound.send(transaction).is_err() {
-      tracing::warn!("observable_bridge_v2 stream is closed; applying {address} locally");
-      return Err(self.pending.lock().remove(&id).expect("inserted above"));
+      tracing::warn!("observable_bridge_v2 stream is closed; dropping the change to {address}");
+      self.pending.lock().remove(&id);
     }
-    Ok(())
   }
 
   /// Handles one transaction received from Thalamus: an acknowledgement

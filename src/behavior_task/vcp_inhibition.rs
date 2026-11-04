@@ -19,7 +19,7 @@ use crate::analog::PointSubscription;
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::{BehaviorTask, TaskContext, TaskSource, Window, task_source};
+use super::{BehaviorTask, TaskContext, Window};
 
 static SUCCESS_SOUND_DATA: &[u8] = include_bytes!("../../assets/success_clip.wav");
 static ABORT_SOUND_DATA: &[u8] = include_bytes!("../../assets/failure_clip.wav");
@@ -2371,10 +2371,6 @@ impl VcpInhibitionTask {
 
 #[async_trait]
 impl BehaviorTask for VcpInhibitionTask {
-  fn source(&self) -> TaskSource {
-    task_source!()
-  }
-
   async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
     Ok(self.run_trial(context).await)
   }

@@ -522,12 +522,26 @@ fn bridge_sends_changes_and_calls_back_on_acknowledgement() {
   );
   assert_eq!(*acknowledged.lock(), 1);
 
-  // Once the stream is gone, writes fall back to applying locally.
+  // Once the stream is gone, writes are dropped, never applied locally.
   drop(rx);
   let (called, callback) = counter();
   root.set_with("a", 3, callback);
-  assert_eq!(root.get("a"), Some(Value::Int(3)));
-  assert_eq!(*called.lock(), 1);
   root.remove("a");
-  assert_eq!(root.to_json(), json!({}));
+  assert_eq!(root.get("a"), Some(Value::Int(2)));
+  assert_eq!(*called.lock(), 0);
+}
+
+#[test]
+fn a_closed_bridge_drops_writes() {
+  let root = state(json!({"a": 1}));
+  let (tx, mut rx) = mpsc::unbounded_channel();
+  let bridge = Bridge::new(tx);
+  bridge.install(&root);
+  bridge.close();
+
+  let (called, callback) = counter();
+  root.set_with("a", 2, callback);
+  assert!(rx.try_recv().is_err(), "nothing sent");
+  assert_eq!(root.get("a"), Some(Value::Int(1)));
+  assert_eq!(*called.lock(), 0);
 }

@@ -16,7 +16,7 @@ use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 #[allow(unused)]
-use super::{BehaviorTask, PointSubscription, TaskContext, TaskSource, Window, task_source, wait_for, wait_for_hold};
+use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait_for_hold};
 
 #[allow(unused)]
 use skia_safe::{
@@ -898,10 +898,6 @@ impl Vcp2AfcTask {
 
 #[async_trait]
 impl BehaviorTask for Vcp2AfcTask {
-  fn source(&self) -> TaskSource {
-    task_source!()
-  }
-
   async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
     Ok(self.run_trial(context).await)
   }
