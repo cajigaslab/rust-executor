@@ -6,7 +6,7 @@ use skia_safe::{Canvas, Color4f, Font, FontMgr, Paint, PaintStyle, Path, PathBui
 
 use crate::pb::task_controller_grpc::TaskResult;
 
-use super::{BehaviorTask, TaskContext, Window};
+use super::{BehaviorTask, TaskContext, TaskSource, Window, task_source};
 
 /// How long the arc takes to grow from empty to a full circle.
 const GROW_DURATION: Duration = Duration::from_secs(1);
@@ -56,13 +56,17 @@ impl SimpleArcTask {
 
 #[async_trait]
 impl BehaviorTask for SimpleArcTask {
-  async fn run(&self, _context: Arc<TaskContext>) -> TaskResult {
+  fn source(&self) -> TaskSource {
+    task_source!()
+  }
+
+  async fn run(&self, _context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
     *self.started_at.lock().unwrap() = Some(Instant::now());
     tokio::time::sleep(GROW_DURATION).await;
-    TaskResult {
+    Ok(TaskResult {
       success: true,
-      cancelled: false,
-    }
+      ..Default::default()
+    })
   }
 
   fn render(&self, canvas: &Canvas, window: Window) {

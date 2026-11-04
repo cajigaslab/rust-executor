@@ -29,6 +29,12 @@ pub fn shared_trial_counter() -> SharedTrialCounter {
 /// `main::run_grpc` and shared with `touch_screen::run`/`eye_tracking::run`,
 /// not created here.
 ///
+/// Each trial starts by logging the executor's version and commit, and
+/// saving the task's source next to the recording (see
+/// `TaskContext::save_task_source`; failing to is only a warning). A task
+/// that returns an error or panics is reported with that error in
+/// `TaskResult.error`, which the task controller shows in an error dialog.
+///
 /// A `TaskConfig` arriving while a task is still running cancels it — the
 /// running task is dropped without completing and reported with
 /// `cancelled = true`. A `TaskConfig` with an empty `body` is a bare cancel;
@@ -42,6 +48,7 @@ pub async fn run(
   let registry = behavior_task::registry();
 
   let mut client = TaskControllerClient::connect(addr.clone()).await?;
+  context.set_task_controller(client.clone());
 
   let (tx, rx) = mpsc::channel::<TaskResult>(8);
   let outbound = ReceiverStream::new(rx);
@@ -98,15 +105,29 @@ pub async fn run(
         );
 
         context.begin_trial(body).await;
+        context.log(&executor_version()).await;
+        // A missing copy of the source isn't worth stopping the session for
+        // (e.g. on a machine where the recording's path doesn't exist), so
+        // a failure is only warned about, here and in the Thalamus log.
+        if let Err(e) = context.save_task_source(task.source()).await {
+          let warning = format!("WARNING {task_type}: failed to save the task's source: {e:#}");
+          tracing::warn!("{warning}");
+          context.log(&warning).await;
+        }
         context.log(&start_message).await;
 
         // Run the task, but keep reading the execution stream alongside it:
         // any `TaskConfig` that arrives mid-trial cancels the running task
         // (dropped without completing, at its next await point). If that
         // config carries a non-empty body it's queued to run next; an empty
-        // body is a bare cancel.
+        // body is a bare cancel. The task runs as its own Tokio task so that
+        // a panic in it is caught and reported like a returned error.
+        let mut running = tokio::spawn({
+          let (task, context) = (task.clone(), context.clone());
+          async move { task.run(context).await }
+        });
         let outcome = tokio::select! {
-          result = task.run(context.clone()) => TrialOutcome::Finished(result),
+          joined = &mut running => TrialOutcome::Finished(task_result(&task_type, joined)),
           message = inbound.message() => match message {
             Ok(Some(next)) => TrialOutcome::Interrupted(next),
             Ok(None) => TrialOutcome::StreamEnded,
@@ -115,6 +136,27 @@ pub async fn run(
               TrialOutcome::StreamEnded
             }
           }
+        };
+        if !matches!(outcome, TrialOutcome::Finished(_)) {
+          // Wait for the task to actually be dropped, as it was when it ran
+          // inline, before going on.
+          running.abort();
+          let _ = running.await;
+        }
+        // The used values the task accumulated go to the TaskController
+        // together, before its result. Only for a task that returned a
+        // result: an errored or cancelled trial gets no summary, and a late
+        // send for a cancelled one could land in the next trial's.
+        let outcome = match outcome {
+          TrialOutcome::Finished(result) if result.error.is_empty() => match context.send_used_values().await {
+            Ok(()) => TrialOutcome::Finished(result),
+            Err(e) => {
+              let error = format!("{task_type}: failed to send used values: {e:#}");
+              tracing::error!("{error}");
+              TrialOutcome::Finished(TaskResult { error, ..Default::default() })
+            }
+          },
+          other => other,
         };
         println!("END!");
         context.log(&finished_message).await;
@@ -132,8 +174,8 @@ pub async fn run(
               pending = Some(next);
             }
             TaskResult {
-              success: false,
               cancelled: true,
+              ..Default::default()
             }
           }
           // The execution stream closed while the task was running; there's
@@ -143,10 +185,7 @@ pub async fn run(
       }
       None => {
         tracing::warn!("no BehaviorTask registered for task_type {task_type:?}");
-        TaskResult {
-          success: false,
-          cancelled: false,
-        }
+        TaskResult::default()
       }
     };
 
@@ -157,6 +196,45 @@ pub async fn run(
   }
 
   Ok(())
+}
+
+/// Logged at the start of every trial.
+fn executor_version() -> String {
+  format!(
+    "EXECUTOR {} {} commit {}",
+    env!("CARGO_PKG_NAME"),
+    env!("CARGO_PKG_VERSION"),
+    env!("EXECUTOR_COMMIT")
+  )
+}
+
+/// The `TaskResult` to report for a task that finished on its own: its own
+/// result, or a failure carrying its error or panic message.
+fn task_result(
+  task_type: &str,
+  joined: Result<anyhow::Result<TaskResult>, tokio::task::JoinError>,
+) -> TaskResult {
+  let error = match joined {
+    Ok(Ok(result)) => return result,
+    // `{:?}` includes the error's chain of causes.
+    Ok(Err(e)) => format!("{task_type}: {e:?}"),
+    Err(e) => match e.try_into_panic() {
+      Ok(payload) => {
+        let message = payload
+          .downcast_ref::<&str>()
+          .map(|s| s.to_string())
+          .or_else(|| payload.downcast_ref::<String>().cloned())
+          .unwrap_or_else(|| "(no message)".to_string());
+        format!("{task_type} panicked: {message}")
+      }
+      Err(e) => format!("{task_type}: {e}"),
+    },
+  };
+  tracing::error!("task failed: {error}");
+  TaskResult {
+    error,
+    ..Default::default()
+  }
 }
 
 /// What ended a trial in `run`'s execution loop.

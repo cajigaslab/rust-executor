@@ -2,16 +2,16 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use kira::sound::static_sound::StaticSoundData;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use skia_safe::{Canvas, Color4f, Paint, Rect};
 
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::config_util::{get_color, get_f64};
-use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait_for_hold};
+use super::{BehaviorTask, PointSubscription, TaskContext, TaskSource, Window, task_source, wait_for, wait_for_hold};
 
 /// Bundled rather than loaded from a path at runtime: tasks are constructed
 /// once at startup (see `registry`), so a missing file would take the whole
@@ -19,15 +19,9 @@ use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait
 static SUCCESS_SOUND_DATA: &[u8] = include_bytes!("../../assets/success_clip.wav");
 static FAILURE_SOUND_DATA: &[u8] = include_bytes!("../../assets/failure_clip.wav");
 
-/// Python falls back to the widget's `logicalDpiX()` when the Thalamus config
-/// has no `dpi`; that config isn't sent to the executor, so this reads `dpi`
-/// from the task config and otherwise assumes the usual logical DPI.
-const DEFAULT_DPI: f64 = 96.0;
 /// Approximate eye-to-screen distance used by Python's `ecc_to_px`.
 const VIEWING_DISTANCE_M: f64 = 0.4;
 const STATE_INDICATOR_WIDTH: f32 = 70.0;
-/// Python's `RANDOM_DEFAULT` (`{'min': 1, 'max': 1}`), in seconds.
-const DEFAULT_TIMEOUT_S: f64 = 1.0;
 
 /// Ported from `ecc_to_px`: converts degrees of eccentricity to pixels
 /// relative to the optical center.
@@ -54,31 +48,79 @@ fn reward_pulse(duration_ms: u64) -> AnalogResponse {
   }
 }
 
-/// Ported from `TaskContext.get_reward`, which reads `reward_schedule` out of
-/// the Thalamus config. That config isn't sent to the executor, so this
-/// looks for `reward_schedule` in the task config instead. Returns `None` if
-/// it isn't there.
-fn reward_ms(config: &Value, channel: usize) -> Option<f64> {
-  let schedule = config.get("reward_schedule")?;
-  let index = schedule.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-  let reward = schedule.get("schedules")?.get(channel)?.get(index)?.as_f64()?;
-  Some(reward.max(0.0))
+/// The trial's used values, sent to the TaskController for its summary.
+type UsedValues = Map<String, Value>;
+
+// The readers below port `TaskContext.get_value`/`get_target_value`/
+// `get_target_color`: each records what it read under `name` in the used
+// values, and is an error where Python raises, rather than guessing.
+
+/// `config[key]`, else `default`: a number, or an object whose `min` and
+/// `max` (each falling back to `default`'s) bound a uniform sample.
+fn number(config: &Value, key: &str, default: Option<&Value>, name: &str, used: &mut UsedValues) -> anyhow::Result<f64> {
+  let value = config.get(key).or(default).with_context(|| format!("{name} is missing"))?;
+  let result = match value {
+    Value::Number(_) => value.clone(),
+    Value::Object(range) => {
+      let bound = |b: &str| {
+        range
+          .get(b)
+          .or_else(|| default.and_then(|d| d.get(b)))
+          .and_then(Value::as_f64)
+          .with_context(|| format!("{name} needs a numeric {b:?}, got {value}"))
+      };
+      let (lower, upper) = (bound("min")?, bound("max")?);
+      // Python's `random.uniform`, which also allows `min > max`.
+      Value::from(lower + (upper - lower) * rand::random::<f64>())
+    }
+    _ => bail!("{name} must be a number or {{min, max}}, got {value}"),
+  };
+  used.insert(name.to_string(), result.clone());
+  Ok(result.as_f64().expect("a number"))
 }
 
-/// Ported from `TaskContext.get_value`/`get_target_value`: reads `key` from
-/// `value_config` (a number or a `{min, max}` object to sample uniformly
-/// from), falling back to `default`, and records it under `name` in
-/// `used_values`.
-fn sample(
-  value_config: &Value,
-  key: &str,
-  default: f64,
-  name: String,
-  used_values: &mut Vec<(String, f64)>,
-) -> f64 {
-  let value = value_config.get(key).map(get_f64).unwrap_or(default);
-  used_values.push((name, value));
-  value
+fn boolean(config: &Value, key: &str, name: &str, used: &mut UsedValues) -> anyhow::Result<bool> {
+  let value = config
+    .get(key)
+    .and_then(Value::as_bool)
+    .with_context(|| format!("{name} must be true or false, got {:?}", config.get(key)))?;
+  used.insert(name.to_string(), Value::Bool(value));
+  Ok(value)
+}
+
+fn string(config: &Value, key: &str, name: &str, used: &mut UsedValues) -> anyhow::Result<String> {
+  let value = config
+    .get(key)
+    .and_then(Value::as_str)
+    .with_context(|| format!("{name} must be a string, got {:?}", config.get(key)))?;
+  used.insert(name.to_string(), Value::from(value));
+  Ok(value.to_string())
+}
+
+/// An `[r, g, b]` list of 0-255 values, white if absent. Python truncates
+/// each with `int`.
+fn color(config: &Value, key: &str, name: &str, used: &mut UsedValues) -> anyhow::Result<Color4f> {
+  let rgb = config.get(key).cloned().unwrap_or(json!([255, 255, 255]));
+  let channel = |i: usize| {
+    rgb
+      .get(i)
+      .and_then(Value::as_f64)
+      .filter(|c| (0.0..256.0).contains(c))
+      .map(|c| c.trunc() as f32 / 255.0)
+      .ok_or_else(|| anyhow!("{name} must be [r, g, b] with each in 0-255, got {rgb}"))
+  };
+  let color = Color4f::new(channel(0)?, channel(1)?, channel(2)?, 1.0);
+  used.insert(name.to_string(), rgb);
+  Ok(color)
+}
+
+/// Python's `int(task_config[key])`, which isn't a used value.
+fn required_int(config: &Value, key: &str) -> anyhow::Result<i32> {
+  let value = config
+    .get(key)
+    .and_then(Value::as_f64)
+    .with_context(|| format!("{key} must be a number, got {:?}", config.get(key)))?;
+  Ok(value as i32)
 }
 
 struct Target {
@@ -176,44 +218,62 @@ impl SimpleTouchTask {
 
 #[async_trait]
 impl BehaviorTask for SimpleTouchTask {
-  async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
-    let config = context.config();
-    let mut used_values = Vec::new();
+  fn source(&self) -> TaskSource {
+    task_source!()
+  }
 
+  async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
+    let config = context.config();
+    let mut used = UsedValues::new();
+
+    // Python's `RANDOM_DEFAULT`.
+    let random_default = json!({"min": 1, "max": 1});
     let mut timeout = |key: &str| {
-      let seconds = sample(&config, key, DEFAULT_TIMEOUT_S, key.to_string(), &mut used_values);
-      Duration::from_secs_f64(seconds.max(0.0))
+      let seconds = number(&config, key, Some(&random_default), key, &mut used)?;
+      Duration::try_from_secs_f64(seconds)
+        .map_err(|_| anyhow!("{key} must be a non-negative number of seconds, got {seconds}"))
     };
-    let intertrial_timeout = timeout("intertrial_timeout");
-    let start_timeout = timeout("start_timeout");
-    let hold_timeout = timeout("hold_timeout");
-    let blink_timeout = timeout("blink_timeout");
-    let fail_timeout = timeout("fail_timeout");
-    let success_timeout = timeout("success_timeout");
-    let is_choice = config.get("is_choice").and_then(Value::as_bool).unwrap_or(false);
+    let intertrial_timeout = timeout("intertrial_timeout")?;
+    let start_timeout = timeout("start_timeout")?;
+    let hold_timeout = timeout("hold_timeout")?;
+    let blink_timeout = timeout("blink_timeout")?;
+    let fail_timeout = timeout("fail_timeout")?;
+    let success_timeout = timeout("success_timeout")?;
+    let is_choice = boolean(&config, "is_choice", "is_choice", &mut used)?;
     let state_indicator = (
-      config.get("state_indicator_x").and_then(Value::as_f64).unwrap_or(180.0) as i32 as f32,
-      config.get("state_indicator_y").and_then(Value::as_f64).unwrap_or(0.0) as i32 as f32,
+      required_int(&config, "state_indicator_x")? as f32,
+      required_int(&config, "state_indicator_y")? as f32,
     );
 
-    let dpi = config.get("dpi").and_then(Value::as_f64).unwrap_or(DEFAULT_DPI);
+    let dpi = context.dpi()?;
     let (canvas_width, canvas_height) = context.canvas_size();
     let canvas_center = (canvas_width as f64 / 2.0, canvas_height as f64 / 2.0);
 
     // Ported from `get_target_rectangles` plus the per-target lists built
     // alongside it in `run`.
-    let target_configs = config.get("targets").and_then(Value::as_array).cloned().unwrap_or_default();
+    let target_configs = config
+      .get("targets")
+      .and_then(Value::as_array)
+      .with_context(|| format!("targets must be a list, got {:?}", config.get("targets")))?;
+    // Where Python's `np.random.randint(0)` raises.
+    ensure!(!target_configs.is_empty(), "no targets configured");
     let mut targets = Vec::with_capacity(target_configs.len());
     for (i, target_config) in target_configs.iter().enumerate() {
-      let mut value = |key: &str, default: f64| {
-        sample(target_config, key, default, format!("targ{i}_{key}"), &mut used_values)
-      };
-      let radius = value("radius", 0.0);
-      let angle = value("angle", 0.0).to_radians();
-      let width = ecc_to_px(value("width", 10.0), dpi);
-      let height = ecc_to_px(value("height", 10.0), dpi);
-      let window = ecc_to_px(value("window_size", 0.0), dpi);
-      let reward_channel = value("reward_channel", 0.0).max(0.0) as usize;
+      let name = |key: &str| format!("targ{i}_{key}");
+      let mut value = |key: &str| number(target_config, key, None, &name(key), &mut used);
+      let radius = value("radius")?;
+      let angle = value("angle")?.to_radians();
+      let width = ecc_to_px(value("width")?, dpi);
+      let height = ecc_to_px(value("height")?, dpi);
+      let window = ecc_to_px(value("window_size")?, dpi);
+      let reward_channel = value("reward_channel")?;
+      // Read only to be recorded, as in Python.
+      value("on_luminance")?;
+      value("off_luminance")?;
+      ensure!(reward_channel >= 0.0, "target {i}'s reward_channel must not be negative, got {reward_channel}");
+      let color = color(target_config, "color", &name("color"), &mut used)?;
+      string(target_config, "name", &name("name"), &mut used)?;
+      let stl_file = string(target_config, "stl_file", &name("stl_file"), &mut used)?;
 
       // Python applies `ecc_to_px` to each cartesian component, then flips y.
       let center = (
@@ -226,32 +286,22 @@ impl BehaviorTask for SimpleTouchTask {
         width as i32 as f32,
         height as i32 as f32,
       );
-      let color = target_config
-        .get("color")
-        .map(get_color)
-        .unwrap_or(Color4f::new(1.0, 1.0, 1.0, 1.0));
 
-      if target_config.get("stl_file").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+      if !stl_file.is_empty() {
         tracing::warn!("simple_touch_task: STL targets aren't supported, drawing target {i} as a rectangle");
       }
 
-      targets.push(Target { rect, center, window, color, reward_channel });
+      targets.push(Target { rect, center, window, color, reward_channel: reward_channel as usize });
     }
 
-    for (name, value) in &used_values {
-      context.log(&format!("trial_summary_data.used_values {name}={value}")).await;
-    }
-
-    if targets.is_empty() {
-      tracing::warn!("simple_touch_task: no targets configured");
-      context.log("simple_touch_task: no targets configured").await;
-      return TaskResult { success: false, cancelled: false };
-    }
+    context.set_used_values(used);
 
     let presented = rand::random_range(0..targets.len());
-    let mut behav_result = json!({
-      "presented_target_ids": if is_choice { (0..targets.len()).collect() } else { vec![presented] },
-    });
+    let mut behav_result = Map::new();
+    behav_result.insert(
+      "presented_target_ids".to_string(),
+      json!(if is_choice { (0..targets.len()).collect() } else { vec![presented] }),
+    );
 
     *self.inner.lock() = Inner {
       targets,
@@ -291,7 +341,7 @@ impl BehaviorTask for SimpleTouchTask {
 
     // state: startacq
     let selected = self.inner.lock().touch.last_selected_target;
-    behav_result["selected_target_id"] = json!(selected);
+    behav_result.insert("selected_target_id".to_string(), json!(selected));
     context.log("BehavState=start_acq").await;
     let success = wait_for_hold(
       touches.notify(),
@@ -304,7 +354,7 @@ impl BehaviorTask for SimpleTouchTask {
 
     if !success {
       context.log("BehavState=fail").await;
-      context.log(&format!("trial_summary_data.behav_result {behav_result}")).await;
+      context.set_behav_result(behav_result).await?;
       // Python's `fail_trial` assigns these without `nonlocal`, so there they
       // never take effect and the target stays up through `fail_timeout`;
       // this does what that code evidently meant to.
@@ -315,7 +365,7 @@ impl BehaviorTask for SimpleTouchTask {
       }
       context.play_sound(self.failure_sound.clone());
       self.sleep(&touches, fail_timeout).await;
-      return TaskResult { success: false, cancelled: false };
+      return Ok(TaskResult { success: false, ..Default::default() });
     }
 
     self.inner.lock().show_presented_target = false;
@@ -326,21 +376,14 @@ impl BehaviorTask for SimpleTouchTask {
     // target has been acquired.
     let selected = selected.expect("start_on exits only after a target is acquired");
     let reward_channel = self.inner.lock().targets[selected].reward_channel;
-    match reward_ms(&config, reward_channel) {
-      Some(reward) => {
-        context.log(&format!("trial_summary_data.used_values reward={reward}")).await;
-        context.inject_analog("Reward", reward_pulse(reward as u64)).await;
-      }
-      None => {
-        tracing::warn!("simple_touch_task: no reward_schedule entry for channel {reward_channel}, not rewarding");
-      }
-    }
+    let reward = context.get_reward(reward_channel)?;
+    context.inject_analog("Reward", reward_pulse(reward as u64)).await;
 
     context.play_sound(self.success_sound.clone());
     self.sleep(&touches, success_timeout).await;
 
-    context.log(&format!("trial_summary_data.behav_result {behav_result}")).await;
-    TaskResult { success: true, cancelled: false }
+    context.set_behav_result(behav_result).await?;
+    Ok(TaskResult { success: true, ..Default::default() })
   }
 
   fn render(&self, canvas: &Canvas, window: Window) {

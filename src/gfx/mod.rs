@@ -259,6 +259,7 @@ impl ApplicationHandler for App {
         }
         let size = graphics.subject.window.inner_size();
         *self.window_size.lock().unwrap() = (size.width, size.height);
+        self.context.set_window_scale_factor(graphics.subject.window.scale_factor());
         self.graphics = Some(graphics);
       }
       Err(e) => self.fail(event_loop, e),
@@ -407,6 +408,8 @@ impl ApplicationHandler for App {
     }
     let size = graphics.subject.window.inner_size();
     *self.window_size.lock().unwrap() = (size.width, size.height);
+    // Changes when the window moves to a monitor with a different scale.
+    self.context.set_window_scale_factor(graphics.subject.window.scale_factor());
 
     graphics.last_frame_at = Instant::now();
     if let Err(e) = graphics.render_frame(

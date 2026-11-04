@@ -14,6 +14,11 @@ use crate::pb::thalamus_grpc::thalamus_client::ThalamusClient;
 use crate::pb::thalamus_grpc::{
   AnalogResponse, InjectAnalogRequest, NodeSelector, Text, inject_analog_request,
 };
+use crate::pb::task_controller_grpc::{BehavResult, UsedValues};
+use crate::pb::thalamus_grpc::NodeRequest;
+use crate::pb::thalamus_grpc::node_response::Status as NodeResponseStatus;
+use super::TaskSource;
+use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
 use crate::state::Dict;
 
 /// How `TaskContext` builds the touch/gaze feed every [`Self::subscribe_to_touch`]/
@@ -122,7 +127,19 @@ pub struct TaskContext {
   /// Thalamus' application state (its whole config), kept in sync over
   /// `observable_bridge_v2` by `main::run_grpc` — see [`Self::app_state`].
   app_state: Arc<Dict>,
+  /// The TaskController's client, set by `task_controller::run` once it
+  /// connects.
+  task_controller: Mutex<Option<TaskControllerClient<Channel>>>,
+  /// The current trial's used values, accumulated by
+  /// [`Self::set_used_values`] and sent by [`Self::send_used_values`].
+  used_values: Mutex<serde_json::Map<String, Value>>,
+  /// The subject window's scale factor (physical pixels per logical pixel),
+  /// kept current by `gfx` — see [`Self::dpi`].
+  window_scale_factor: Mutex<f64>,
 }
+
+/// Qt's logical DPI at a scale factor of 1.
+const BASE_LOGICAL_DPI: f64 = 96.0;
 
 impl TaskContext {
   pub fn new(thalamus_client: ThalamusClient<Channel>, audio_manager: AudioManager, canvas_size: Arc<Mutex<(u32, u32)>>) -> Self {
@@ -139,6 +156,9 @@ impl TaskContext {
       connections: Mutex::new(HashMap::new()),
       _canvas_size: canvas_size,
       app_state: Dict::new(),
+      task_controller: Mutex::new(None),
+      used_values: Mutex::new(serde_json::Map::new()),
+      window_scale_factor: Mutex::new(1.0),
     }
   }
 
@@ -151,6 +171,183 @@ impl TaskContext {
   /// etc. to find out when that's happened.
   pub fn app_state(&self) -> Arc<Dict> {
     self.app_state.clone()
+  }
+
+  /// Ported from Python's `context.config.get('dpi', None) or
+  /// context.widget.logicalDpiX()`: the Thalamus config's `dpi` if it's set
+  /// to anything but 0 or null, else the subject window's logical DPI. Qt's
+  /// logical DPI is 96 times the screen's scale factor, and this executor
+  /// draws in physical pixels, which is the same thing. An error if `dpi` is
+  /// set to something other than a number.
+  pub fn dpi(&self) -> anyhow::Result<f64> {
+    match self.app_state.get("dpi") {
+      None | Some(crate::state::Value::Null) => Ok(self.logical_dpi()),
+      Some(value) => {
+        let Ok(dpi) = f64::try_from(value.clone()) else {
+          anyhow::bail!("the Thalamus config's dpi must be a number, got {}", value.to_json());
+        };
+        Ok(if dpi == 0.0 { self.logical_dpi() } else { dpi })
+      }
+    }
+  }
+
+  fn logical_dpi(&self) -> f64 {
+    BASE_LOGICAL_DPI * *self.window_scale_factor.lock().unwrap()
+  }
+
+  /// Called by `gfx` with the subject window's current scale factor.
+  pub fn set_window_scale_factor(&self, scale_factor: f64) {
+    *self.window_scale_factor.lock().unwrap() = scale_factor;
+  }
+
+  /// Ported from `TaskContext.get_reward`: the current reward for `channel`,
+  /// `reward_schedule.schedules[channel][index]` in the Thalamus config,
+  /// clamped to at least 0. Records the unclamped value as the `reward` used
+  /// value, as Python does. An error if the schedule doesn't have that
+  /// entry, where Python raises. Python's task controller advances `index`
+  /// after each successful trial, so this doesn't.
+  pub fn get_reward(&self, channel: usize) -> anyhow::Result<f64> {
+    let schedule = self
+      .app_state
+      .get("reward_schedule")
+      .ok_or_else(|| anyhow::anyhow!("the Thalamus config has no reward_schedule"))?
+      .to_json();
+    let index = schedule
+      .get("index")
+      .and_then(Value::as_u64)
+      .ok_or_else(|| anyhow::anyhow!("reward_schedule.index must be a non-negative integer: {schedule}"))?;
+    let reward = schedule
+      .get("schedules")
+      .and_then(|s| s.get(channel))
+      .and_then(|s| s.get(index as usize))
+      .and_then(Value::as_f64)
+      .ok_or_else(|| anyhow::anyhow!("reward_schedule has no number at schedules[{channel}][{index}]: {schedule}"))?;
+    self.set_used_values(serde_json::Map::from_iter([("reward".to_string(), Value::from(reward))]));
+    Ok(reward.max(0.0))
+  }
+
+  /// Called by `task_controller::run` once it's connected.
+  pub fn set_task_controller(&self, client: TaskControllerClient<Channel>) {
+    *self.task_controller.lock().unwrap() = Some(client);
+  }
+
+  /// Merges `values` into the running trial's used values, which the
+  /// TaskController puts in the trial summary: Python tasks'
+  /// `context.trial_summary_data.used_values[key] = value`. They're kept
+  /// here and sent together once the task returns a result (see
+  /// [`Self::send_used_values`]).
+  pub fn set_used_values(&self, values: serde_json::Map<String, Value>) {
+    self.used_values.lock().unwrap().extend(values);
+  }
+
+  /// Sends the trial's accumulated used values to the TaskController, if
+  /// there are any. Called by `task_controller::run` after the task returns
+  /// a result, before reporting it, so they're in that trial's summary. An
+  /// error if the TaskController isn't connected or rejects the call.
+  pub async fn send_used_values(&self) -> anyhow::Result<()> {
+    let values = std::mem::take(&mut *self.used_values.lock().unwrap());
+    if values.is_empty() {
+      return Ok(());
+    }
+    let mut client = self.task_controller_client()?;
+    let body = Value::Object(values).to_string();
+    client
+      .set_used_values(UsedValues { body: body.clone() })
+      .await
+      .map_err(|e| anyhow::anyhow!("the TaskController rejected used values {body}: {e}"))?;
+    Ok(())
+  }
+
+  /// Replaces the running trial's behav_result, which the TaskController
+  /// puts in the trial summary: Python tasks' `context.behav_result = ...`.
+  /// Await it before the task returns, so it's there before the result is.
+  pub async fn set_behav_result(&self, result: serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    let mut client = self.task_controller_client()?;
+    let body = Value::Object(result).to_string();
+    client
+      .set_behav_result(BehavResult { body: body.clone() })
+      .await
+      .map_err(|e| anyhow::anyhow!("the TaskController rejected behav_result {body}: {e}"))?;
+    Ok(())
+  }
+
+  /// Ported from `TaskContext.node_request`: sends `request` to the node
+  /// named `name` and returns its JSON response. Uses Thalamus' unary
+  /// `node_request` RPC rather than Python's per-node request streams.
+  pub async fn node_request(&self, name: &str, request: &Value) -> anyhow::Result<Value> {
+    let response = self
+      .thalamus_client
+      .clone()
+      .node_request(NodeRequest {
+        node: name.to_string(),
+        json: request.to_string(),
+        ..Default::default()
+      })
+      .await
+      .map_err(|e| anyhow::anyhow!("node_request to {name} failed: {e}"))?
+      .into_inner();
+    anyhow::ensure!(
+      response.status == NodeResponseStatus::Ok as i32,
+      "node_request to {name} returned status {:?}",
+      NodeResponseStatus::try_from(response.status).map_or_else(|_| response.status.to_string(), |s| format!("{s:?}"))
+    );
+    serde_json::from_str(&response.json)
+      .map_err(|e| anyhow::anyhow!("node_request to {name} returned invalid JSON {:?}: {e}", response.json))
+  }
+
+  /// Ported from `TaskContext.save_task_source`: if a STORAGE2 node is
+  /// running, saves `source` next to the file it's recording to, as
+  /// `<that file>.<source file name>`, unless that's already there. The
+  /// path is the storage node's, so this writes to the right place only on
+  /// the machine (or a share) where that path is the recording's.
+  pub async fn save_task_source(&self, source: TaskSource) -> anyhow::Result<()> {
+    let Some(nodes) = self.app_state.get("nodes") else {
+      return Ok(());
+    };
+    let nodes = nodes.to_json();
+    let storage = nodes.as_array().into_iter().flatten().find(|node| {
+      node.get("type").and_then(Value::as_str) == Some("STORAGE2")
+        && node.get("Running").and_then(Value::as_bool).unwrap_or(false)
+    });
+    let Some(storage) = storage else {
+      return Ok(());
+    };
+    let name = storage
+      .get("name")
+      .and_then(Value::as_str)
+      .ok_or_else(|| anyhow::anyhow!("the running STORAGE2 node has no name: {storage}"))?;
+
+    let response = self.node_request(name, &serde_json::json!({"type": "get_current_file"})).await?;
+    tracing::debug!("current_file {response}");
+    let current_file = match &response {
+      // Python's `if not response: return`.
+      Value::Null | Value::Bool(false) => return Ok(()),
+      Value::String(file) if file.is_empty() => return Ok(()),
+      Value::String(file) => file,
+      other => anyhow::bail!("{name}'s get_current_file returned {other}, not a file name"),
+    };
+
+    let out_path = std::path::PathBuf::from(format!("{current_file}.{}", source.file_name()));
+    // `create_new`, so an existing copy is never overwritten.
+    match std::fs::File::create_new(&out_path) {
+      Ok(mut file) => {
+        use std::io::Write;
+        file
+          .write_all(source.code.as_bytes())
+          .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", out_path.display()))
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+      Err(e) => Err(anyhow::anyhow!("failed to create {}: {e}", out_path.display())),
+    }
+  }
+
+  fn task_controller_client(&self) -> anyhow::Result<TaskControllerClient<Channel>> {
+    self
+      .task_controller
+      .lock()
+      .unwrap()
+      .clone()
+      .ok_or_else(|| anyhow::anyhow!("the TaskController isn't connected"))
   }
 
   /// Registers `factory` as how [`Self::subscribe_to_touch`] builds the
@@ -260,7 +457,7 @@ impl TaskContext {
 
   /// Ported from the per-trial reset at the top of `TaskContext.run`
   /// (task_context.py:723-745): swaps in `config` for the trial about to
-  /// start, reopens the `log` stream (Python opens `self.log_queue`/
+  /// start, clears the used values, reopens the `log` stream (Python opens `self.log_queue`/
   /// `log_coroutine` fresh every trial and closes them at trial end — see
   /// `reopen_log_stream`), and resends the `node` handshake on every
   /// already-open `inject_analog` stream (Python's `refresh_streams`).
@@ -269,6 +466,7 @@ impl TaskContext {
   /// for the whole session and only swaps out what changes per trial.
   pub async fn begin_trial(&self, config: Value) {
     *self.config.lock().unwrap() = config;
+    self.used_values.lock().unwrap().clear();
     self.reopen_log_stream().await;
     self.refresh_inject_analog_streams().await;
   }

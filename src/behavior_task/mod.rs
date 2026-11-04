@@ -21,6 +21,36 @@ pub use task_context::{PointSubscription, TaskContext};
 pub use vcp_inhibition::VcpInhibitionTask;
 pub use vcp_2afc_task::Vcp2AfcTask;
 
+/// A task's source file, embedded in the executor at build time so it can
+/// be saved alongside each recording (see `TaskContext::save_task_source`).
+#[derive(Clone, Copy, Debug)]
+pub struct TaskSource {
+  /// The file's path relative to the crate, as `file!()` gives it.
+  pub path: &'static str,
+  pub code: &'static str,
+}
+
+impl TaskSource {
+  /// The file's name, e.g. `simple_touch_task.rs`.
+  pub fn file_name(&self) -> &'static str {
+    std::path::Path::new(self.path)
+      .file_name()
+      .and_then(|name| name.to_str())
+      .unwrap_or(self.path)
+  }
+}
+
+/// The [`TaskSource`] of the file this is invoked in.
+macro_rules! task_source {
+  () => {
+    $crate::behavior_task::TaskSource {
+      path: file!(),
+      code: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", file!())),
+    }
+  };
+}
+pub(crate) use task_source;
+
 /// Which physical window a `render` call is currently producing pixels for.
 /// See [`BehaviorTask`] for how the render thread drives this each frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -34,7 +64,9 @@ pub enum Window {
 ///
 /// `run` performs the task's own timing/logic and resolves once the task is
 /// done, returning the `TaskResult` `task_controller::run` reports back to
-/// the TaskController's execution stream. Every frame, the render thread
+/// the TaskController's execution stream. Returning an error instead (or
+/// panicking) fails the trial with that error, which the task controller
+/// shows in an error dialog, as it does for a Python task's exception. Every frame, the render thread
 /// renders the task in two phases —
 /// concurrently with `run`, for as long as the task is the current one: it
 /// calls `render` with `Window::Subject` to draw the subject view, then
@@ -56,8 +88,12 @@ pub enum Window {
 /// different threads at the same time.
 #[async_trait]
 pub trait BehaviorTask: Send + Sync {
-  async fn run(&self, context: Arc<TaskContext>) -> TaskResult;
+  async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult>;
   fn render(&self, canvas: &Canvas, window: Window);
+
+  /// This task's source file: implement it as `task_source!()`. Ported from
+  /// Python's `inspect.getsourcefile(task.run)` in `save_task_source`.
+  fn source(&self) -> TaskSource;
 
   /// Draws this task's own control panel in the operator view, in the space
   /// underneath the mirrored subject-view image (see
@@ -191,3 +227,26 @@ async fn wait_for(
 
     true
   }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn every_task_embeds_its_own_source_file() {
+    for (task_type, task) in registry() {
+      let source = task.source();
+      assert!(source.file_name().ends_with(".rs"), "{task_type}: {}", source.path);
+      let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(source.path);
+      assert_eq!(source.code, std::fs::read_to_string(&path).unwrap(), "{task_type}");
+    }
+    assert_eq!(SimpleTouchTask::new().source().file_name(), "simple_touch_task.rs");
+  }
+
+  #[test]
+  fn the_commit_is_embedded() {
+    let commit = env!("EXECUTOR_COMMIT");
+    let hash = commit.strip_suffix("-dirty").unwrap_or(commit);
+    assert!(hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()), "{commit}");
+  }
+}

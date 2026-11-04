@@ -19,7 +19,7 @@ use crate::analog::PointSubscription;
 use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
-use super::{BehaviorTask, TaskContext, Window};
+use super::{BehaviorTask, TaskContext, TaskSource, Window, task_source};
 
 static SUCCESS_SOUND_DATA: &[u8] = include_bytes!("../../assets/success_clip.wav");
 static ABORT_SOUND_DATA: &[u8] = include_bytes!("../../assets/failure_clip.wav");
@@ -936,7 +936,7 @@ impl VcpInhibitionTask {
 
     TaskResult {
       success: false,
-      cancelled: false,
+      ..Default::default()
     }
   }
 
@@ -1421,9 +1421,10 @@ impl VcpInhibitionTask {
   }
 }
 
-#[async_trait]
-impl BehaviorTask for VcpInhibitionTask {
-  async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
+impl VcpInhibitionTask {
+  /// The trial itself, for [`BehaviorTask::run`]. Its config errors still
+  /// panic rather than being returned.
+  async fn run_trial(&self, context: Arc<TaskContext>) -> TaskResult {
     *self.trial.lock().unwrap() = None;
     *self.state.lock().unwrap() = None;
     *self.screen_gaze_queue.lock().unwrap() = None;
@@ -2181,7 +2182,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
       return TaskResult {
         success: false,
-        cancelled: false,
+        ..Default::default()
       };
     }
 
@@ -2270,7 +2271,7 @@ impl BehaviorTask for VcpInhibitionTask {
 
       return TaskResult {
         success: false,
-        cancelled: false,
+        ..Default::default()
       };
     }
 
@@ -2363,8 +2364,19 @@ impl BehaviorTask for VcpInhibitionTask {
     // is the intended behavior, not a bug to "fix" into `success: true`.
     TaskResult {
       success: false,
-      cancelled: false,
+      ..Default::default()
     }
+  }
+}
+
+#[async_trait]
+impl BehaviorTask for VcpInhibitionTask {
+  fn source(&self) -> TaskSource {
+    task_source!()
+  }
+
+  async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
+    Ok(self.run_trial(context).await)
   }
 
   /// Ported from the Python task's `renderer` (lines 1045-1209). Not

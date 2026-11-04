@@ -16,7 +16,7 @@ use crate::pb::task_controller_grpc::TaskResult;
 use crate::pb::thalamus_grpc::{AnalogResponse, Span};
 
 #[allow(unused)]
-use super::{BehaviorTask, PointSubscription, TaskContext, Window, wait_for, wait_for_hold};
+use super::{BehaviorTask, PointSubscription, TaskContext, TaskSource, Window, task_source, wait_for, wait_for_hold};
 
 #[allow(unused)]
 use skia_safe::{
@@ -475,9 +475,10 @@ fn draw_text(canvas: &Canvas, text: &str, x: f32, y: f32, background_color_qt: C
   canvas.draw_str(text, (x + 4.0, y + 19.0), render_font(), &foreground_paint);
 }
 
-#[async_trait]
-impl BehaviorTask for Vcp2AfcTask {
-  async fn run(&self, context: Arc<TaskContext>) -> TaskResult {
+impl Vcp2AfcTask {
+  /// The trial itself, for [`BehaviorTask::run`]. Its config errors still
+  /// panic rather than being returned.
+  async fn run_trial(&self, context: Arc<TaskContext>) -> TaskResult {
     let config = &context.config();
     let canvas_size = context.canvas_size();
     let converter = Converter::from_config(config, canvas_size);
@@ -725,7 +726,7 @@ impl BehaviorTask for Vcp2AfcTask {
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
 
       sleep(&gaze_queue, get_gaze, penalty_delay).await;
-      return TaskResult { success: false, cancelled: false };
+      return TaskResult { success: false, ..Default::default() };
     }
     
     self.set_state(&context, "BehavState=DELAY", State::Delay).await;
@@ -768,7 +769,7 @@ impl BehaviorTask for Vcp2AfcTask {
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_abort_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
       sleep(&gaze_queue, get_gaze, penalty_delay).await;
-      return TaskResult { success: false, cancelled: false };
+      return TaskResult { success: false, ..Default::default() };
     }
 
     let wrong_positions = if task_group == "Shapes" {
@@ -830,7 +831,7 @@ impl BehaviorTask for Vcp2AfcTask {
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
       sleep(&gaze_queue, get_gaze, penalty_delay).await;
-      return TaskResult { success: false, cancelled: false };
+      return TaskResult { success: false, ..Default::default() };
     }
 
     self.set_state(&context, "BehavState=HOLD_CHOICE_start", State::HoldChoice).await;
@@ -864,7 +865,7 @@ impl BehaviorTask for Vcp2AfcTask {
                             SUCCESS_RATE={trial_success_rate}, ABORT_RATE={new_trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
       
       sleep(&gaze_queue, get_gaze, penalty_delay).await;
-      return TaskResult { success: false, cancelled: false };
+      return TaskResult { success: false, ..Default::default() };
     }
 
     let gaze = self.inner.lock().gaze;
@@ -891,7 +892,18 @@ impl BehaviorTask for Vcp2AfcTask {
     context.log(&format!("TRIAL_NUM={trial_num}, SUCCESS_COUNT={trial_success_count} \
                           SUCCESS_RATE={new_trial_success_rate}, ABORT_RATE={trial_failure_rate}, FAILURE_RATE={trial_failure_rate}")).await;
 
-    TaskResult { success: true, cancelled: false }
+    TaskResult { success: true, ..Default::default() }
+  }
+}
+
+#[async_trait]
+impl BehaviorTask for Vcp2AfcTask {
+  fn source(&self) -> TaskSource {
+    task_source!()
+  }
+
+  async fn run(&self, context: Arc<TaskContext>) -> anyhow::Result<TaskResult> {
+    Ok(self.run_trial(context).await)
   }
 
   fn render(&self, canvas: &Canvas, window: Window) {
