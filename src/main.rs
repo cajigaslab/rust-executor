@@ -134,8 +134,19 @@ async fn run_grpc(
   // wherever observable_bridge_v2 ends up redirecting to below — so this
   // connects right away, ahead of resolving that redirect, rather than
   // waiting on it for no reason.
-  let unredirected_addr = addr.clone();
-  let analog_client = ThalamusClient::connect(unredirected_addr.clone()).await?;
+  // The executor may be started before Thalamus, so this waits for it to
+  // come up.
+  let endpoint = tonic::transport::Endpoint::from_shared(addr.clone())?;
+  let analog_channel = loop {
+    match endpoint.connect().await {
+      Ok(channel) => break channel,
+      Err(e) => {
+        println!("waiting for {addr}: {e}");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+      }
+    }
+  };
+  let analog_client = ThalamusClient::new(analog_channel);
 
   // A real Thalamus `TaskContext` is constructed once for the whole task
   // controller session and shared by every trial (`task_controller::run`)

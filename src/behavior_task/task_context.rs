@@ -18,7 +18,7 @@ use crate::pb::task_controller_grpc::{BehavResult, UsedValues};
 use crate::pb::thalamus_grpc::NodeRequest;
 use crate::pb::thalamus_grpc::node_response::Status as NodeResponseStatus;
 use crate::pb::task_controller_grpc::task_controller_client::TaskControllerClient;
-use crate::state::Dict;
+use crate::state::{Dict, Value as StateValue};
 
 /// How `TaskContext` builds the touch/gaze feed every [`Self::subscribe_to_touch`]/
 /// [`Self::subscribe_to_gaze`] caller gets back — see
@@ -313,23 +313,25 @@ impl TaskContext {
     if diff.is_empty() {
       return Ok(());
     }
-    let Some(nodes) = self.app_state.get("nodes") else {
+    let Some(nodes) = self.app_state.get("nodes").and_then(|nodes| nodes.as_list().cloned()) else {
       return Ok(());
     };
-    let nodes = nodes.to_json();
-    let storage = nodes.as_array().into_iter().flatten().find(|node| {
-      node.get("type").and_then(Value::as_str).is_some_and(is_storage_type)
-        && node.get("Running").and_then(Value::as_bool).unwrap_or(false)
+    // Read straight from the state tree, rather than converting all of the
+    // nodes' configs to JSON for three fields.
+    let storage = nodes.entries().into_iter().find_map(|(_, node)| {
+      let node = node.as_dict()?.clone();
+      let is_storage = matches!(node.get("type"), Some(StateValue::String(t)) if is_storage_type(&t));
+      let running = node.get("Running") == Some(StateValue::Bool(true));
+      (is_storage && running).then_some(node)
     });
     let Some(storage) = storage else {
       return Ok(());
     };
-    let name = storage
-      .get("name")
-      .and_then(Value::as_str)
-      .ok_or_else(|| anyhow::anyhow!("the running storage node has no name: {storage}"))?;
+    let Some(StateValue::String(name)) = storage.get("name") else {
+      anyhow::bail!("the running storage node has no name: {}", storage.to_json());
+    };
 
-    let response = self.node_request(name, &serde_json::json!({"type": "get_current_file"})).await?;
+    let response = self.node_request(&name, &serde_json::json!({"type": "get_current_file"})).await?;
     tracing::debug!("current_file {response}");
     let current_file = match &response {
       // Python's `if not response: return`.
